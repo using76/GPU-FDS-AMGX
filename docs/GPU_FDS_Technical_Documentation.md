@@ -858,4 +858,547 @@ nvidia-smi dmon -s pucvmet -d 1
 
 ---
 
+## 부록 D: 상세 코드 분석
+
+### D.1 amgx_c_wrapper.c - C/CUDA 래퍼
+
+#### D.1.1 파일 개요
+
+```c
+/**
+ * @file amgx_c_wrapper.c
+ * @brief C wrapper for NVIDIA AmgX library to interface with Fortran FDS code
+ *
+ * 핵심 기능:
+ * 1. Fortran-C 인터페이스 제공 (ISO_C_BINDING 호환)
+ * 2. Zone 관리 시스템 (다중 메시 지원)
+ * 3. 희소 행렬 형식 변환 (상삼각 → 전체 대칭)
+ * 4. GPU 모니터링 (NVML 연동)
+ */
+```
+
+#### D.1.2 핵심 데이터 구조
+
+```c
+#define MAX_ZONES 256  // 최대 256개 메시 동시 지원
+
+typedef struct {
+    // AmgX 핸들들
+    AMGX_config_handle cfg;      // 솔버 설정
+    AMGX_resources_handle rsrc;  // GPU 리소스
+    AMGX_matrix_handle A;        // 계수 행렬
+    AMGX_vector_handle b;        // RHS 벡터
+    AMGX_vector_handle x;        // 솔루션 벡터
+    AMGX_solver_handle solver;   // 솔버 인스턴스
+
+    // 상태 플래그
+    int initialized;    // Zone 초기화 완료 여부
+    int n;              // 행렬 크기 (미지수 개수)
+    int nnz;            // 비영 요소 개수
+    int setup_done;     // 솔버 setup 완료 여부
+    int zone_id;        // FDS 원본 Zone ID
+} AmgxZone;
+
+static AmgxZone zones[MAX_ZONES];  // Zone 배열
+```
+
+**설계 이유**:
+- FDS는 다중 메시(Multi-mesh) 시뮬레이션 지원
+- 각 메시는 독립적인 압력 시스템을 가짐
+- Zone 배열로 최대 256개 독립 솔버 관리
+
+#### D.1.3 Zone ID 매핑 함수
+
+```c
+/**
+ * FDS Zone ID (예: 1001, 2003) → 내부 인덱스 (0-255)
+ *
+ * FDS Zone ID 형식: NM * 1000 + IPZ
+ *   - NM: 메시 번호 (1, 2, 3, ...)
+ *   - IPZ: 압력 존 번호 (0, 1, 2, ...)
+ *   - 예: MESH 1의 Zone 1 = 1001
+ */
+static int find_zone_slot(int zone_id, int allocate)
+{
+    int i;
+    int free_slot = -1;
+
+    // 기존 Zone 검색
+    for (i = 0; i < MAX_ZONES; i++) {
+        if (zones[i].initialized && zones[i].zone_id == zone_id) {
+            return i;  // 이미 존재하는 Zone 반환
+        }
+        if (!zones[i].initialized && free_slot < 0) {
+            free_slot = i;  // 빈 슬롯 기록
+        }
+    }
+
+    // allocate=1이면 새 슬롯 반환, 아니면 -1
+    return allocate ? free_slot : -1;
+}
+```
+
+**알고리즘 복잡도**: O(n) - 최대 256번 순회
+
+#### D.1.4 AmgX 솔버 설정
+
+```c
+static const char* default_config =
+    "config_version=2, "
+
+    // 주 솔버: FGMRES (Flexible GMRES)
+    "solver(main)=FGMRES, "
+    "main:gmres_n_restart=10, "      // 10회마다 재시작
+    "main:max_iters=100, "           // 최대 100회 반복
+    "main:tolerance=1e-8, "          // 수렴 허용오차
+    "main:convergence=RELATIVE_INI, "// 상대 잔차 기준
+    "main:norm=L2, "                 // L2 노름 사용
+    "main:monitor_residual=1, "      // 잔차 모니터링
+
+    // 전처리기: AMG (Algebraic Multigrid)
+    "main:preconditioner(amg)=AMG, "
+    "amg:algorithm=AGGREGATION, "    // 집합 기반 AMG
+    "amg:selector=SIZE_2, "          // 크기 2 선택자
+    "amg:smoother=MULTICOLOR_DILU, " // 다색 DILU 스무더
+    "amg:presweeps=0, "              // 사전 스무딩 0회
+    "amg:postsweeps=3, "             // 사후 스무딩 3회
+    "amg:cycle=V, "                  // V-사이클
+    "amg:max_levels=50, "            // 최대 50 레벨
+    "amg:coarse_solver=DENSE_LU_SOLVER, "  // 조립 레벨: Dense LU
+    "amg:min_coarse_rows=32";        // 최소 조밀 행 수
+```
+
+**솔버 선택 이유**:
+| 설정 | 이유 |
+|------|------|
+| FGMRES | 비대칭 전처리기와 호환, 강건함 |
+| AMG 전처리 | O(n) 복잡도, 조건수에 무관 |
+| AGGREGATION | GPU 친화적, 메모리 효율적 |
+| MULTICOLOR_DILU | 병렬 스무딩 가능 |
+| V-cycle | 일반적으로 효율적 |
+
+#### D.1.5 행렬 형식 변환 알고리즘
+
+```c
+void amgx_upload_matrix_(int *zone_id, int *n, int *nnz,
+                         int *row_ptrs, int *col_indices, double *values,
+                         int *ierr)
+{
+    /*
+     * 입력: FDS 상삼각 행렬 (1-based 인덱싱)
+     *   - 대각 요소 + 상삼각 요소만 저장
+     *   - 메모리 절약 (대칭이므로 하삼각 불필요)
+     *
+     * 출력: AmgX 전체 행렬 (0-based 인덱싱)
+     *   - 대칭 행렬 복원 (A[i][j] = A[j][i])
+     *   - AmgX가 내부적으로 대칭 최적화 사용
+     */
+
+    // 1단계: 전체 비영 요소 개수 계산
+    int nnz_full = 0;
+    for (int i = 0; i < nnz_upper; i++) {
+        if (row == col) {
+            nnz_full++;      // 대각: 1번
+        } else {
+            nnz_full += 2;   // 비대각: 2번 (i,j)와 (j,i)
+        }
+    }
+
+    // 2단계: 각 행별 요소 수 계산
+    int *row_nnz = (int*)calloc(n_rows, sizeof(int));
+    for (int row = 0; row < n_rows; row++) {
+        for (int j = row_ptrs[row] - 1; j < row_ptrs[row + 1] - 1; j++) {
+            int col = col_indices[j] - 1;  // 0-based 변환
+            row_nnz[row]++;
+            if (row != col) {
+                row_nnz[col]++;  // 대칭 위치
+            }
+        }
+    }
+
+    // 3단계: CSR row_ptrs 생성
+    full_row_ptrs[0] = 0;
+    for (int i = 0; i < n_rows; i++) {
+        full_row_ptrs[i + 1] = full_row_ptrs[i] + row_nnz[i];
+    }
+
+    // 4단계: 열 인덱스별 정렬 후 최종 배열 생성
+    // (각 행 내에서 열 인덱스 오름차순 정렬 필요)
+
+    // 5단계: AmgX로 업로드
+    AMGX_matrix_upload_all(zones[zid].A, n_rows, nnz_full, 1, 1,
+                           full_row_ptrs, full_col_indices, full_values, NULL);
+}
+```
+
+**메모리 변화 예시 (32×32×32 메시)**:
+```
+상삼각 저장: ~127,532 요소 × 8 bytes = 1.0 MB
+전체 행렬:   ~222,404 요소 × 8 bytes = 1.7 MB
+증가율: ~75%
+```
+
+#### D.1.6 선형 시스템 풀이
+
+```c
+void amgx_solve_(int *zone_id, int *n, double *rhs, double *sol, int *ierr)
+{
+    // 1. RHS 벡터 업로드 (CPU → GPU)
+    AMGX_vector_upload(zones[zid].b, *n, 1, rhs);
+
+    // 2. 초기 추정값 업로드 (이전 시간 스텝 해를 사용)
+    AMGX_vector_upload(zones[zid].x, *n, 1, sol);
+
+    // 3. GPU에서 풀이 수행
+    AMGX_solver_solve(zones[zid].solver, zones[zid].b, zones[zid].x);
+
+    // 4. 수렴 상태 확인
+    AMGX_SOLVE_STATUS status;
+    AMGX_solver_get_status(zones[zid].solver, &status);
+
+    // 5. 솔루션 다운로드 (GPU → CPU)
+    AMGX_vector_download(zones[zid].x, sol);
+}
+```
+
+**데이터 전송 비용**:
+```
+업로드:   n × 8 bytes × 2 (RHS + 초기값)
+다운로드: n × 8 bytes × 1 (솔루션)
+총:       n × 24 bytes/timestep
+
+32³ 메시: 32,660 × 24 = ~0.78 MB/timestep
+128³ 메시: 2,097,152 × 24 = ~50 MB/timestep
+```
+
+#### D.1.7 GPU 모니터링 (NVML)
+
+```c
+#ifdef WITH_NVML
+#include <nvml.h>
+
+void amgx_get_gpu_utilization_(int *util, int *ierr)
+{
+    nvmlUtilization_t utilization;
+    nvmlReturn_t result = nvmlDeviceGetUtilizationRates(nvml_device, &utilization);
+    *util = (int)utilization.gpu;  // 0-100%
+}
+
+void amgx_get_gpu_memory_(double *used_mb, double *total_mb, int *ierr)
+{
+    size_t free_bytes, total_bytes;
+    cudaMemGetInfo(&free_bytes, &total_bytes);
+    *total_mb = (double)total_bytes / (1024.0 * 1024.0);
+    *used_mb = (double)(total_bytes - free_bytes) / (1024.0 * 1024.0);
+}
+#endif
+```
+
+---
+
+### D.2 amgx_fortran.f90 - Fortran 인터페이스
+
+#### D.2.1 ISO_C_BINDING 인터페이스
+
+```fortran
+MODULE AMGX_FORTRAN
+
+USE ISO_C_BINDING
+USE PRECISION_PARAMETERS, ONLY: EB  ! 8-byte 실수
+
+IMPLICIT NONE
+PRIVATE
+
+! C 함수 인터페이스 선언
+INTERFACE
+   SUBROUTINE amgx_solve_c(zone_id, n, rhs, sol, ierr) &
+              BIND(C, NAME='amgx_solve_')
+      IMPORT :: C_INT, C_DOUBLE
+      INTEGER(C_INT), INTENT(IN) :: zone_id, n
+      REAL(C_DOUBLE), INTENT(IN) :: rhs(*)
+      REAL(C_DOUBLE), INTENT(INOUT) :: sol(*)
+      INTEGER(C_INT), INTENT(OUT) :: ierr
+   END SUBROUTINE
+END INTERFACE
+```
+
+**핵심 개념**:
+- `ISO_C_BINDING`: Fortran 2003 표준 C 상호운용성 모듈
+- `BIND(C, NAME='...')`: C 함수 이름 지정 (언더스코어 포함)
+- `C_INT`, `C_DOUBLE`: C 호환 데이터 타입
+
+#### D.2.2 Fortran 래퍼 서브루틴
+
+```fortran
+!> @brief 선형 시스템 Ax = b 풀이
+SUBROUTINE AMGX_SOLVE(ZONE_ID, N, F_H, X_H, IERR)
+   INTEGER, INTENT(IN) :: ZONE_ID       ! Zone 식별자
+   INTEGER, INTENT(IN) :: N             ! 미지수 개수
+   REAL(EB), INTENT(IN) :: F_H(:)       ! RHS 벡터
+   REAL(EB), INTENT(INOUT) :: X_H(:)    ! 솔루션 벡터
+   INTEGER, INTENT(OUT) :: IERR         ! 에러 코드
+
+   ! C 호환 변수로 변환
+   INTEGER(C_INT) :: C_ZONE_ID, C_N, C_IERR
+
+   C_ZONE_ID = INT(ZONE_ID, C_INT)
+   C_N = INT(N, C_INT)
+
+   ! C 함수 호출
+   CALL amgx_solve_c(C_ZONE_ID, C_N, F_H, X_H, C_IERR)
+
+   IERR = INT(C_IERR)
+END SUBROUTINE AMGX_SOLVE
+```
+
+**데이터 타입 매핑**:
+| Fortran | C | 크기 |
+|---------|---|------|
+| `INTEGER` | `int` | 4 bytes |
+| `REAL(EB)` | `double` | 8 bytes |
+| `CHARACTER` | `char*` | 가변 |
+
+---
+
+### D.3 pres.f90 - FDS 압력 솔버 수정
+
+#### D.3.1 GPU 솔버 강제 적용
+
+```fortran
+! 위치: pres.f90, 약 1232행
+
+! FFT가 작동할 수 있더라도 GPU 솔버 강제 사용
+#ifdef WITH_AMGX
+IF (FORCE_GPU_SOLVER) THEN
+   ZM%USE_FFT = .FALSE.  ! FFT 비활성화
+   IF (MY_RANK==0 .AND. IPZ==0) &
+      WRITE(LU_ERR,'(A,I5)') ' GPU Solver: Forcing AmgX for MESH ', NM
+ENDIF
+#endif
+```
+
+**배경**:
+- FDS는 정규 직육면체 메시에서 FFT 솔버를 기본 사용
+- FFT는 O(n log n)으로 작은 문제에서 효율적
+- GPU 솔버 테스트를 위해 강제 플래그 추가
+
+#### D.3.2 AmgX 솔버 호출 (시간 루프)
+
+```fortran
+! 위치: pres.f90, PRESSURE_SOLVER_CHECK_RESIDUALS 서브루틴, 약 1735행
+
+CASE(AMGX_FLAG) LIBRARY_SELECT
+#ifdef WITH_AMGX
+   ! ============================================================
+   ! NVIDIA AmgX GPU Solve
+   ! ============================================================
+
+   ! 부정치 행렬 처리 (열린 경계 조건)
+   IF (ZM%MTYPE==SYMM_INDEFINITE) ZM%F_H(ZM%NUNKH) = 0._EB
+
+   ! GPU 솔버 호출
+   CALL AMGX_SOLVE(ZM%AMGX_ZONE_ID, ZM%NUNKH, ZM%F_H, ZM%X_H, ERROR)
+
+   ! 솔루션 검증 (NaN, Inf 체크)
+   CALL AMGX_CHECK_SOLUTION(ZM%NUNKH, ZM%X_H, ZM%AMGX_ZONE_ID, SOL_VALID, SOL_ERROR_MSG)
+   IF (.NOT. SOL_VALID) THEN
+      IF (MY_RANK==0) THEN
+         WRITE(LU_ERR,'(A)') '*** AmgX SOLVER ERROR ***'
+         WRITE(LU_ERR,'(A)') TRIM(SOL_ERROR_MSG)
+      ENDIF
+      STOP_STATUS = NUMERICAL_INSTABILITY
+   ENDIF
+
+   ! 수렴 실패 처리
+   IF (ERROR /= 0) THEN
+      CALL AMGX_GET_ITERATIONS(ZM%AMGX_ZONE_ID, AMGX_ITERS, IRC)
+      CALL AMGX_GET_RESIDUAL(ZM%AMGX_ZONE_ID, AMGX_RESIDUAL, IRC)
+      IF (MY_RANK==0) THEN
+         WRITE(LU_ERR,'(A,I5,A,I5,A,ES12.5)') 'AmgX: Zone ', ZM%AMGX_ZONE_ID, &
+               ' not converged. Iters=', AMGX_ITERS, ', Residual=', AMGX_RESIDUAL
+      ENDIF
+   ENDIF
+
+   ! GPU 상태 로깅 (100 타임스텝마다)
+   IF (IPZ==1 .AND. MOD(ICYC,100)==0 .AND. MY_RANK==0) THEN
+      CALL AMGX_LOG_GPU_STATUS(ZM%AMGX_ZONE_ID, ICYC, IRC)
+   ENDIF
+#endif
+```
+
+#### D.3.3 행렬 설정 (초기화 단계)
+
+```fortran
+! 위치: pres.f90, BUILD_SPARSE_MATRIX_ULMAT 서브루틴, 약 3007행
+
+CASE(AMGX_FLAG) LIBRARY_SELECT
+#ifdef WITH_AMGX
+   ! Zone ID 계산: MESH_NUMBER * 1000 + ZONE_NUMBER + 1
+   ZM%AMGX_ZONE_ID = NM * 1000 + IPZ + 1
+
+   ! CSR 행렬 배열 할당
+   IF (ALLOCATED(ZM%A_H))  DEALLOCATE(ZM%A_H)
+   IF (ALLOCATED(ZM%IA_H)) DEALLOCATE(ZM%IA_H)
+   IF (ALLOCATED(ZM%JA_H)) DEALLOCATE(ZM%JA_H)
+   ALLOCATE(ZM%A_H(INNZ))    ! 행렬 값
+   ALLOCATE(ZM%IA_H(NUNKH+1)) ! 행 포인터
+   ALLOCATE(ZM%JA_H(INNZ))   ! 열 인덱스
+
+   ! 행렬 값 채우기 (기존 FDS 로직 사용)
+   ! ... (상삼각 CSR 형식으로 저장)
+
+   ! 행렬 검증
+   CALL AMGX_CHECK_MATRIX(ZM%NUNKH, INNZ, ZM%IA_H, ZM%JA_H, ZM%A_H, &
+                          ZM%AMGX_ZONE_ID, MATRIX_VALID, ERROR_MSG)
+   IF (.NOT. MATRIX_VALID) THEN
+      IF (MY_RANK==0) WRITE(LU_ERR,'(A)') TRIM(ERROR_MSG)
+      STOP_STATUS = SETUP_STOP
+      RETURN
+   ENDIF
+
+   ! AmgX Zone 설정 및 행렬 업로드
+   CALL AMGX_SETUP_ZONE(ZM%AMGX_ZONE_ID, ZM%NUNKH, INNZ, ERROR)
+   CALL AMGX_UPLOAD_MATRIX(ZM%AMGX_ZONE_ID, ZM%NUNKH, INNZ, &
+                           ZM%IA_H, ZM%JA_H, ZM%A_H, ERROR)
+
+   ZM%AMGX_SETUP_DONE = .TRUE.
+#endif
+```
+
+---
+
+### D.4 cons.f90 - 상수 및 플래그 정의
+
+```fortran
+! 솔버 라이브러리 플래그
+INTEGER, PARAMETER :: MKL_PARDISO_FLAG=1  ! Intel MKL PARDISO
+INTEGER, PARAMETER :: HYPRE_FLAG=2        ! HYPRE (CPU 반복법)
+INTEGER, PARAMETER :: AMGX_FLAG=3         ! NVIDIA AmgX (GPU)
+
+! 기본 솔버 선택 (컴파일 옵션에 따라)
+#ifdef WITH_AMGX
+INTEGER :: ULMAT_SOLVER_LIBRARY=AMGX_FLAG  ! AmgX가 있으면 기본 사용
+#else
+INTEGER :: ULMAT_SOLVER_LIBRARY=MKL_PARDISO_FLAG
+#endif
+
+! GPU 솔버 강제 사용 플래그
+LOGICAL :: FORCE_GPU_SOLVER=.FALSE.
+```
+
+---
+
+### D.5 read.f90 - 입력 파일 파싱
+
+```fortran
+! PRES 네임리스트에 새 옵션 추가
+NAMELIST /PRES/ BAROCLINIC, CHECK_POISSON, FISHPAK_BC, FORCE_GPU_SOLVER, ...
+
+! SOLVER 옵션 처리
+CASE('GPU','AMGX','ULMAT AMGX')
+   ! GPU 가속 솔버 사용
+   PRES_METHOD = 'GPU'
+   PRES_FLAG   = ULMAT_FLAG
+   PRES_ON_WHOLE_DOMAIN = .FALSE.
+   IF (CHECK_POISSON) GLMAT_VERBOSE=.TRUE.
+   ULMAT_SOLVER_LIBRARY = AMGX_FLAG
+   FORCE_GPU_SOLVER = .TRUE.  ! FFT 대신 강제로 GPU 사용
+```
+
+**사용자 입력 파일 예시**:
+```fortran
+! simple_test.fds
+&PRES SOLVER='GPU'/   ! GPU 솔버 활성화
+! 또는
+&PRES SOLVER='AMGX'/  ! 동일
+! 또는
+&PRES SOLVER='ULMAT AMGX'/  ! 명시적
+```
+
+---
+
+### D.6 컴파일 플래그 및 빌드 시스템
+
+#### D.6.1 makefile_amgx 주요 설정
+
+```makefile
+# AmgX 컴파일 플래그
+AMGX_CFLAGS = -DWITH_AMGX -I$(AMGX_HOME)/../include -I$(CUDA_HOME)/include
+AMGX_LDFLAGS = -L$(AMGX_HOME) -L$(CUDA_HOME)/lib64
+
+# 링크 라이브러리 순서 (중요!)
+AMGX_LIBS = $(AMGX_HOME)/libamgx.a \
+            -lcudart -lcublas -lcusparse -lcusolver \
+            -lstdc++ -lm
+
+# C 래퍼 컴파일
+amgx_c_wrapper.o: ../FDS_CPU_Source/amgx_c_wrapper.c
+	$(CC) -c -O2 -fPIC $(AMGX_CFLAGS) $<
+
+# Fortran 모듈 컴파일
+amgx_fortran.o: ../FDS_CPU_Source/amgx_fortran.f90
+	$(FC) -c $(FFLAGS) -DWITH_AMGX $<
+```
+
+#### D.6.2 컴파일 순서 의존성
+
+```
+1. prec.o          (PRECISION_PARAMETERS 모듈)
+2. cons.o          (상수 - AMGX_FLAG 정의)
+3. amgx_c_wrapper.o (C 래퍼 - 의존성 없음)
+4. amgx_fortran.o  (Fortran 인터페이스 - prec.o 필요)
+5. amgx_validation.o (검증 루틴)
+6. pres.o          (압력 솔버 - 위 모든 모듈 필요)
+7. main.o          (메인 프로그램)
+8. 최종 링크       (모든 .o + AmgX 라이브러리)
+```
+
+---
+
+## 부록 E: 테스트 환경 및 재현 방법
+
+### E.1 테스트 환경
+
+| 항목 | 사양 |
+|------|------|
+| GPU | NVIDIA RTX 4090 (24GB VRAM) |
+| CPU | AMD Ryzen 9 @ 4.2GHz |
+| OS | WSL2 Ubuntu 22.04 |
+| CUDA | 12.x |
+| 컴파일러 | GCC 11, GFortran 11 |
+| MPI | OpenMPI 4.1 |
+
+### E.2 빌드 재현
+
+```bash
+# 1. 환경 설정
+export AMGX_HOME=/path/to/AMGX/build
+export CUDA_HOME=/usr/local/cuda
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$AMGX_HOME:$LD_LIBRARY_PATH
+
+# 2. 클린 빌드
+cd Build_WSL
+make -f ../FDS_CPU_Source/makefile_amgx clean
+make -f ../FDS_CPU_Source/makefile_amgx ompi_gnu_linux_amgx -j4
+
+# 3. 테스트 실행
+cd ../test
+mpirun --allow-run-as-root -np 1 ../Build_WSL/fds_ompi_gnu_linux_amgx simple_test.fds
+```
+
+### E.3 성능 측정 방법
+
+```bash
+# GPU 사용률 모니터링
+nvidia-smi dmon -s pucvmet -d 1
+
+# 상세 프로파일링
+nsys profile --stats=true mpirun -np 1 ./fds_amgx test.fds
+
+# 메모리 사용량 확인
+nvidia-smi --query-gpu=memory.used,memory.total --format=csv -l 1
+```
+
+---
+
 **문서 끝**
