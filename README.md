@@ -2,6 +2,8 @@
 
 GPU-accelerated pressure Poisson solver for [Fire Dynamics Simulator (FDS)](https://github.com/firemodels/fds) using NVIDIA AmgX library.
 
+> **This project powers [BULC](https://www.msimul.com)**, the advanced fire simulator developed by **Meteorsimulation**.
+
 ## Overview
 
 This project integrates NVIDIA's [AmgX](https://github.com/NVIDIA/AMGX) GPU solver library into FDS to accelerate the pressure Poisson equation solving, which is one of the most computationally intensive parts of CFD fire simulations.
@@ -153,14 +155,29 @@ bash run_gpu_sim.sh
 
 ## Performance
 
+### Test Environment
+- **GPU**: NVIDIA RTX 4090 (24GB VRAM)
+- **CPU**: AMD Ryzen 9 @ 4.2GHz (2 cores used for comparison)
+
 ### Speedup vs Mesh Size
 
 | Mesh Size | Cells | CPU (FFT) | GPU (AmgX) | Speedup |
 |-----------|-------|-----------|------------|---------|
 | 32³ | 32K | Faster | Slower | <1x |
-| 64³ | 262K | Baseline | 2-3x | 2-3x |
-| 128³ | 2M | Baseline | 5-10x | 5-10x |
-| 256³ | 16M | Baseline | 10-20x | 10-20x |
+| 64³ | 262K | Baseline | ~2x | ~2x |
+| 128³ | 2M | Baseline | 2-5x | 2-5x |
+| 256³ | 16M | Baseline | 3-10x | 3-10x |
+
+### Known Limitations
+
+The speedup is lower than theoretical expectations. We suspect this is due to **CPU-GPU data transfer overhead** - each timestep requires uploading the right-hand side vector and downloading the solution. However, the exact bottleneck is not yet fully identified and requires further profiling.
+
+### Future Optimization Goals
+
+- **Data transfer optimization**: Reduce CPU-GPU memory transfer overhead
+- **Pinned memory**: Use page-locked host memory for faster DMA transfers
+- **Asynchronous transfers**: Overlap computation with data movement
+- **Multi-GPU support**: Distribute large problems across multiple GPUs
 
 ### When to Use GPU Solver
 
