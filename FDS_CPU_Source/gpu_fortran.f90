@@ -29,6 +29,11 @@ PUBLIC :: GPU_KERNEL_ALLOCATE_MESH
 PUBLIC :: GPU_KERNEL_UPLOAD_GRID
 PUBLIC :: GPU_KERNEL_UPLOAD_GRAVITY
 
+! Persistent Field Upload (Performance Optimization)
+PUBLIC :: GPU_KERNEL_UPLOAD_VELOCITY
+PUBLIC :: GPU_KERNEL_UPLOAD_THERMO
+PUBLIC :: GPU_KERNEL_INVALIDATE_CACHE
+
 ! Diffusion Kernels
 PUBLIC :: GPU_COMPUTE_SPECIES_DIFFUSION
 PUBLIC :: GPU_COMPUTE_SPECIES_DIFFUSION_SINGLE
@@ -106,6 +111,33 @@ INTERFACE
       REAL(C_DOUBLE), INTENT(IN)  :: gx(*), gy(*), gz(*)
       INTEGER(C_INT), INTENT(OUT) :: ierr
    END SUBROUTINE gpu_kernel_upload_gravity_c
+
+   !-------------------------------------------------------------------------
+   ! Persistent Field Upload (Performance Optimization)
+   !-------------------------------------------------------------------------
+
+   SUBROUTINE gpu_kernel_upload_velocity_c(mesh_id, uu, vv, ww, ierr) &
+              BIND(C, NAME='gpu_kernel_upload_velocity_')
+      IMPORT :: C_INT, C_DOUBLE
+      INTEGER(C_INT), INTENT(IN)  :: mesh_id
+      REAL(C_DOUBLE), INTENT(IN)  :: uu(*), vv(*), ww(*)
+      INTEGER(C_INT), INTENT(OUT) :: ierr
+   END SUBROUTINE gpu_kernel_upload_velocity_c
+
+   SUBROUTINE gpu_kernel_upload_thermo_c(mesh_id, rhop, mu, dp, tmp, kp, ierr) &
+              BIND(C, NAME='gpu_kernel_upload_thermo_')
+      IMPORT :: C_INT, C_DOUBLE
+      INTEGER(C_INT), INTENT(IN)  :: mesh_id
+      REAL(C_DOUBLE), INTENT(IN)  :: rhop(*), mu(*), dp(*), tmp(*), kp(*)
+      INTEGER(C_INT), INTENT(OUT) :: ierr
+   END SUBROUTINE gpu_kernel_upload_thermo_c
+
+   SUBROUTINE gpu_kernel_invalidate_cache_c(mesh_id, ierr) &
+              BIND(C, NAME='gpu_kernel_invalidate_cache_')
+      IMPORT :: C_INT
+      INTEGER(C_INT), INTENT(IN)  :: mesh_id
+      INTEGER(C_INT), INTENT(OUT) :: ierr
+   END SUBROUTINE gpu_kernel_invalidate_cache_c
 
    !-------------------------------------------------------------------------
    ! Diffusion Kernels
@@ -304,6 +336,75 @@ SUBROUTINE GPU_KERNEL_UPLOAD_GRAVITY(NM, GX, GY, GZ, IERR)
    CALL gpu_kernel_upload_gravity_c(INT(NM, C_INT), GX, GY, GZ, C_IERR)
    IERR = INT(C_IERR)
 END SUBROUTINE GPU_KERNEL_UPLOAD_GRAVITY
+
+!============================================================================
+! Persistent Field Upload (Performance Optimization)
+!============================================================================
+
+!> Upload velocity components to persistent GPU storage
+!>
+!> Call once per timestep to upload velocity field. The data is stored
+!> persistently on GPU and reused across multiple kernel calls within
+!> the same timestep.
+!>
+!> @param[in]  NM    Mesh number
+!> @param[in]  UU    X-velocity (0:IBAR+1,0:JBAR+1,0:KBAR+1)
+!> @param[in]  VV    Y-velocity
+!> @param[in]  WW    Z-velocity
+!> @param[out] IERR  Error code (0=success)
+SUBROUTINE GPU_KERNEL_UPLOAD_VELOCITY(NM, UU, VV, WW, IERR)
+   INTEGER, INTENT(IN) :: NM
+   REAL(EB), INTENT(IN) :: UU(0:,0:,0:)
+   REAL(EB), INTENT(IN) :: VV(0:,0:,0:)
+   REAL(EB), INTENT(IN) :: WW(0:,0:,0:)
+   INTEGER, INTENT(OUT) :: IERR
+   INTEGER(C_INT) :: C_IERR
+
+   CALL gpu_kernel_upload_velocity_c(INT(NM, C_INT), UU, VV, WW, C_IERR)
+   IERR = INT(C_IERR)
+END SUBROUTINE GPU_KERNEL_UPLOAD_VELOCITY
+
+!> Upload thermodynamic properties to persistent GPU storage
+!>
+!> Call once per timestep to upload thermodynamic properties. The data
+!> is stored persistently on GPU and reused across multiple kernel calls.
+!>
+!> @param[in]  NM    Mesh number
+!> @param[in]  RHOP  Density
+!> @param[in]  MU    Dynamic viscosity
+!> @param[in]  DP    Pressure gradient / Divergence
+!> @param[in]  TMP   Temperature (optional, pass zero-sized array if not needed)
+!> @param[in]  KP    Thermal conductivity (optional)
+!> @param[out] IERR  Error code (0=success)
+SUBROUTINE GPU_KERNEL_UPLOAD_THERMO(NM, RHOP, MU, DP, TMP, KP, IERR)
+   INTEGER, INTENT(IN) :: NM
+   REAL(EB), INTENT(IN) :: RHOP(0:,0:,0:)
+   REAL(EB), INTENT(IN) :: MU(0:,0:,0:)
+   REAL(EB), INTENT(IN) :: DP(0:,0:,0:)
+   REAL(EB), INTENT(IN) :: TMP(0:,0:,0:)
+   REAL(EB), INTENT(IN) :: KP(0:,0:,0:)
+   INTEGER, INTENT(OUT) :: IERR
+   INTEGER(C_INT) :: C_IERR
+
+   CALL gpu_kernel_upload_thermo_c(INT(NM, C_INT), RHOP, MU, DP, TMP, KP, C_IERR)
+   IERR = INT(C_IERR)
+END SUBROUTINE GPU_KERNEL_UPLOAD_THERMO
+
+!> Invalidate persistent field caches
+!>
+!> Call at start of new timestep to mark cached data as stale.
+!> Kernels will then re-upload data as needed.
+!>
+!> @param[in]  NM    Mesh number
+!> @param[out] IERR  Error code (0=success)
+SUBROUTINE GPU_KERNEL_INVALIDATE_CACHE(NM, IERR)
+   INTEGER, INTENT(IN) :: NM
+   INTEGER, INTENT(OUT) :: IERR
+   INTEGER(C_INT) :: C_IERR
+
+   CALL gpu_kernel_invalidate_cache_c(INT(NM, C_INT), C_IERR)
+   IERR = INT(C_IERR)
+END SUBROUTINE GPU_KERNEL_INVALIDATE_CACHE
 
 !============================================================================
 ! Diffusion Kernels

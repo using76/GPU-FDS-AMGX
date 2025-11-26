@@ -135,8 +135,32 @@ typedef struct {
     double *d_FX, *d_FY, *d_FZ;
     double *d_U_DOT_DEL;
 
-    /* CUDA stream */
+    /* ========== PERSISTENT FIELD ARRAYS (Performance Optimization) ========== */
+    /* Velocity components - uploaded once per timestep, reused across kernels */
+    double *d_UU, *d_VV, *d_WW;
+    int velocity_uploaded;  /* Flag: 1 if velocity is current */
+
+    /* Thermodynamic properties - uploaded once, reused across kernels */
+    double *d_RHOP;         /* Density perturbation */
+    double *d_MU;           /* Dynamic viscosity */
+    double *d_DP;           /* Pressure gradient / Divergence */
+    double *d_TMP;          /* Temperature */
+    double *d_KP;           /* Thermal conductivity */
+    int thermo_uploaded;    /* Flag: 1 if thermodynamic properties are current */
+
+    /* Species arrays - for multi-species calculations */
+    double *d_ZZP;          /* Species mass fraction (single species buffer) */
+    double *d_RHO_D;        /* Species diffusivity */
+    double *d_DEL_RHO_D_DEL_Z; /* Diffusion flux */
+
+    /* ========== PINNED MEMORY BUFFERS (Fast DMA Transfers) ========== */
+    double *pinned_upload;   /* Page-locked buffer for host->device */
+    double *pinned_download; /* Page-locked buffer for device->host */
+    size_t pinned_size;      /* Size of pinned buffers in bytes */
+
+    /* ========== CUDA RESOURCES ========== */
     cudaStream_t stream;
+    cudaStream_t stream_upload;  /* Secondary stream for async uploads */
 
 } GPUKernelContext;
 
@@ -228,8 +252,30 @@ void gpu_kernel_finalize_(int* ierr) {
             if (ctx->d_FZ) cudaFree(ctx->d_FZ);
             if (ctx->d_U_DOT_DEL) cudaFree(ctx->d_U_DOT_DEL);
 
-            /* Destroy stream */
+            /* Free persistent velocity arrays */
+            if (ctx->d_UU) cudaFree(ctx->d_UU);
+            if (ctx->d_VV) cudaFree(ctx->d_VV);
+            if (ctx->d_WW) cudaFree(ctx->d_WW);
+
+            /* Free persistent thermodynamic arrays */
+            if (ctx->d_RHOP) cudaFree(ctx->d_RHOP);
+            if (ctx->d_MU) cudaFree(ctx->d_MU);
+            if (ctx->d_DP) cudaFree(ctx->d_DP);
+            if (ctx->d_TMP) cudaFree(ctx->d_TMP);
+            if (ctx->d_KP) cudaFree(ctx->d_KP);
+
+            /* Free persistent species arrays */
+            if (ctx->d_ZZP) cudaFree(ctx->d_ZZP);
+            if (ctx->d_RHO_D) cudaFree(ctx->d_RHO_D);
+            if (ctx->d_DEL_RHO_D_DEL_Z) cudaFree(ctx->d_DEL_RHO_D_DEL_Z);
+
+            /* Free pinned memory buffers */
+            if (ctx->pinned_upload) cudaFreeHost(ctx->pinned_upload);
+            if (ctx->pinned_download) cudaFreeHost(ctx->pinned_download);
+
+            /* Destroy streams */
             if (ctx->stream) cudaStreamDestroy(ctx->stream);
+            if (ctx->stream_upload) cudaStreamDestroy(ctx->stream_upload);
 
             ctx->initialized = 0;
         }
@@ -325,13 +371,53 @@ void gpu_kernel_allocate_mesh_(int* mesh_id, int* ibar, int* jbar, int* kbar,
     err = cudaMalloc(&ctx->d_U_DOT_DEL, size_3d);
     if (err != cudaSuccess) goto cuda_error;
 
-    /* Create CUDA stream */
+    /* ========== PERSISTENT FIELD ARRAYS ========== */
+    /* Allocate velocity arrays */
+    err = cudaMalloc(&ctx->d_UU, size_3d);
+    if (err != cudaSuccess) goto cuda_error;
+    err = cudaMalloc(&ctx->d_VV, size_3d);
+    if (err != cudaSuccess) goto cuda_error;
+    err = cudaMalloc(&ctx->d_WW, size_3d);
+    if (err != cudaSuccess) goto cuda_error;
+    ctx->velocity_uploaded = 0;
+
+    /* Allocate thermodynamic property arrays */
+    err = cudaMalloc(&ctx->d_RHOP, size_3d);
+    if (err != cudaSuccess) goto cuda_error;
+    err = cudaMalloc(&ctx->d_MU, size_3d);
+    if (err != cudaSuccess) goto cuda_error;
+    err = cudaMalloc(&ctx->d_DP, size_3d);
+    if (err != cudaSuccess) goto cuda_error;
+    err = cudaMalloc(&ctx->d_TMP, size_3d);
+    if (err != cudaSuccess) goto cuda_error;
+    err = cudaMalloc(&ctx->d_KP, size_3d);
+    if (err != cudaSuccess) goto cuda_error;
+    ctx->thermo_uploaded = 0;
+
+    /* Allocate species arrays */
+    err = cudaMalloc(&ctx->d_ZZP, size_3d);
+    if (err != cudaSuccess) goto cuda_error;
+    err = cudaMalloc(&ctx->d_RHO_D, size_3d);
+    if (err != cudaSuccess) goto cuda_error;
+    err = cudaMalloc(&ctx->d_DEL_RHO_D_DEL_Z, size_3d);
+    if (err != cudaSuccess) goto cuda_error;
+
+    /* ========== PINNED MEMORY FOR FAST TRANSFERS ========== */
+    ctx->pinned_size = size_3d;
+    err = cudaMallocHost(&ctx->pinned_upload, size_3d);
+    if (err != cudaSuccess) goto cuda_error;
+    err = cudaMallocHost(&ctx->pinned_download, size_3d);
+    if (err != cudaSuccess) goto cuda_error;
+
+    /* ========== CREATE CUDA STREAMS ========== */
     err = cudaStreamCreate(&ctx->stream);
+    if (err != cudaSuccess) goto cuda_error;
+    err = cudaStreamCreate(&ctx->stream_upload);
     if (err != cudaSuccess) goto cuda_error;
 
     ctx->initialized = 1;
 
-    fprintf(stderr, " GPU Kernel Context: Allocated mesh %d (%dx%dx%d)\n",
+    fprintf(stderr, " GPU Kernel Context: Allocated mesh %d (%dx%dx%d) with persistent memory\n",
             *mesh_id, *ibar, *jbar, *kbar);
     *ierr = GPU_SUCCESS;
     return;
@@ -410,6 +496,80 @@ void gpu_kernel_upload_gravity_(int* mesh_id, double* GX, double* GY, double* GZ
 cuda_error:
     fprintf(stderr, "ERROR: Gravity upload failed: %s\n", cudaGetErrorString(err));
     *ierr = GPU_ERROR;
+}
+
+/* ============================================================================
+ * Persistent Field Upload Functions (Performance Optimization)
+ * ============================================================================ */
+
+/* Upload velocity components to persistent GPU storage
+ * Call once per timestep, reused across multiple kernel calls */
+void gpu_kernel_upload_velocity_(int* mesh_id, double* UU, double* VV, double* WW, int* ierr) {
+    int slot = find_context_slot(*mesh_id);
+    if (slot < 0) {
+        *ierr = GPU_ERROR;
+        return;
+    }
+
+    GPUKernelContext* ctx = &kernel_contexts[slot];
+    size_t n3d = calc_3d_size(ctx->ibar, ctx->jbar, ctx->kbar);
+    size_t size_3d = n3d * sizeof(double);
+
+    /* Use async transfers with pinned memory staging if possible */
+    cudaMemcpyAsync(ctx->d_UU, UU, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+    cudaMemcpyAsync(ctx->d_VV, VV, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+    cudaMemcpyAsync(ctx->d_WW, WW, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+
+    /* Synchronize upload stream to ensure data is ready */
+    cudaStreamSynchronize(ctx->stream_upload);
+
+    ctx->velocity_uploaded = 1;
+    *ierr = GPU_SUCCESS;
+}
+
+/* Upload thermodynamic properties to persistent GPU storage
+ * Call once per timestep, reused across multiple kernel calls */
+void gpu_kernel_upload_thermo_(int* mesh_id, double* RHOP, double* MU, double* DP,
+                                double* TMP, double* KP, int* ierr) {
+    int slot = find_context_slot(*mesh_id);
+    if (slot < 0) {
+        *ierr = GPU_ERROR;
+        return;
+    }
+
+    GPUKernelContext* ctx = &kernel_contexts[slot];
+    size_t n3d = calc_3d_size(ctx->ibar, ctx->jbar, ctx->kbar);
+    size_t size_3d = n3d * sizeof(double);
+
+    /* Use async transfers */
+    cudaMemcpyAsync(ctx->d_RHOP, RHOP, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+    cudaMemcpyAsync(ctx->d_MU, MU, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+    cudaMemcpyAsync(ctx->d_DP, DP, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+    if (TMP != NULL) {
+        cudaMemcpyAsync(ctx->d_TMP, TMP, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+    }
+    if (KP != NULL) {
+        cudaMemcpyAsync(ctx->d_KP, KP, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+    }
+
+    cudaStreamSynchronize(ctx->stream_upload);
+
+    ctx->thermo_uploaded = 1;
+    *ierr = GPU_SUCCESS;
+}
+
+/* Invalidate persistent field caches - call at start of new timestep */
+void gpu_kernel_invalidate_cache_(int* mesh_id, int* ierr) {
+    int slot = find_context_slot(*mesh_id);
+    if (slot < 0) {
+        *ierr = GPU_ERROR;
+        return;
+    }
+
+    GPUKernelContext* ctx = &kernel_contexts[slot];
+    ctx->velocity_uploaded = 0;
+    ctx->thermo_uploaded = 0;
+    *ierr = GPU_SUCCESS;
 }
 
 /* ============================================================================
@@ -712,7 +872,10 @@ cleanup:
     cudaFree(d_TYZ);
 }
 
-/* Compute full velocity flux (vorticity/stress + FVX/FVY/FVZ) */
+/* Compute full velocity flux (vorticity/stress + FVX/FVY/FVZ)
+ * OPTIMIZED: Uses persistent GPU memory for velocity/thermo fields.
+ * If persistent data not uploaded, falls back to per-call upload.
+ */
 void gpu_compute_velocity_flux_(int* mesh_id,
                                  double* UU, double* VV, double* WW,
                                  double* RHOP, double* MU, double* DP,
@@ -728,41 +891,52 @@ void gpu_compute_velocity_flux_(int* mesh_id,
     size_t n3d = calc_3d_size(ctx->ibar, ctx->jbar, ctx->kbar);
     size_t size_3d = n3d * sizeof(double);
 
-    /* Allocate temporary device arrays */
-    double *d_UU, *d_VV, *d_WW, *d_RHOP, *d_MU, *d_DP;
+    /* Use persistent arrays if available, otherwise upload fresh */
+    double *d_UU_use, *d_VV_use, *d_WW_use;
+    double *d_RHOP_use, *d_MU_use, *d_DP_use;
+    int need_velocity_upload = !ctx->velocity_uploaded;
+    int need_thermo_upload = !ctx->thermo_uploaded;
+
+    /* Point to persistent storage */
+    d_UU_use = ctx->d_UU;
+    d_VV_use = ctx->d_VV;
+    d_WW_use = ctx->d_WW;
+    d_RHOP_use = ctx->d_RHOP;
+    d_MU_use = ctx->d_MU;
+    d_DP_use = ctx->d_DP;
+
+    /* Upload velocity if not cached */
+    if (need_velocity_upload) {
+        cudaMemcpyAsync(d_UU_use, UU, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+        cudaMemcpyAsync(d_VV_use, VV, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+        cudaMemcpyAsync(d_WW_use, WW, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+    }
+
+    /* Upload thermodynamic properties if not cached */
+    if (need_thermo_upload) {
+        cudaMemcpyAsync(d_RHOP_use, RHOP, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+        cudaMemcpyAsync(d_MU_use, MU, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+        cudaMemcpyAsync(d_DP_use, DP, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+    }
+
+    /* Wait for uploads to complete before computing */
+    if (need_velocity_upload || need_thermo_upload) {
+        cudaStreamSynchronize(ctx->stream_upload);
+    }
+
+    /* Allocate ONLY output arrays (these must be downloaded every call) */
     double *d_FVX, *d_FVY, *d_FVZ;
-
     cudaError_t err;
-    err = cudaMalloc(&d_UU, size_3d);
-    if (err != cudaSuccess) { *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_VV, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_UU); *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_WW, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_UU); cudaFree(d_VV); *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_RHOP, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_UU); cudaFree(d_VV); cudaFree(d_WW); *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_MU, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_UU); cudaFree(d_VV); cudaFree(d_WW); cudaFree(d_RHOP); *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_DP, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_UU); cudaFree(d_VV); cudaFree(d_WW); cudaFree(d_RHOP); cudaFree(d_MU); *ierr = GPU_ERROR; return; }
     err = cudaMalloc(&d_FVX, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_UU); cudaFree(d_VV); cudaFree(d_WW); cudaFree(d_RHOP); cudaFree(d_MU); cudaFree(d_DP); *ierr = GPU_ERROR; return; }
+    if (err != cudaSuccess) { *ierr = GPU_ERROR; return; }
     err = cudaMalloc(&d_FVY, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_UU); cudaFree(d_VV); cudaFree(d_WW); cudaFree(d_RHOP); cudaFree(d_MU); cudaFree(d_DP); cudaFree(d_FVX); *ierr = GPU_ERROR; return; }
+    if (err != cudaSuccess) { cudaFree(d_FVX); *ierr = GPU_ERROR; return; }
     err = cudaMalloc(&d_FVZ, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_UU); cudaFree(d_VV); cudaFree(d_WW); cudaFree(d_RHOP); cudaFree(d_MU); cudaFree(d_DP); cudaFree(d_FVX); cudaFree(d_FVY); *ierr = GPU_ERROR; return; }
-
-    /* Upload data */
-    cudaMemcpy(d_UU, UU, size_3d, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_VV, VV, size_3d, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_WW, WW, size_3d, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_RHOP, RHOP, size_3d, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_MU, MU, size_3d, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_DP, DP, size_3d, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { cudaFree(d_FVX); cudaFree(d_FVY); *ierr = GPU_ERROR; return; }
 
     /* Step 1: Compute vorticity and stress tensor */
     int result = gpu_vorticity_stress(
-        d_UU, d_VV, d_WW, d_MU,
+        d_UU_use, d_VV_use, d_WW_use, d_MU_use,
         ctx->d_RDXN, ctx->d_RDYN, ctx->d_RDZN,
         ctx->d_OMX, ctx->d_OMY, ctx->d_OMZ,
         ctx->d_TXY, ctx->d_TXZ, ctx->d_TYZ,
@@ -778,7 +952,7 @@ void gpu_compute_velocity_flux_(int* mesh_id,
 
     /* Step 2: Compute velocity flux */
     result = gpu_velocity_flux(
-        d_UU, d_VV, d_WW, d_RHOP, d_MU, d_DP,
+        d_UU_use, d_VV_use, d_WW_use, d_RHOP_use, d_MU_use, d_DP_use,
         ctx->d_OMX, ctx->d_OMY, ctx->d_OMZ,
         ctx->d_TXY, ctx->d_TXZ, ctx->d_TYZ,
         ctx->d_RDX, ctx->d_RDXN, ctx->d_RDY, ctx->d_RDYN, ctx->d_RDZ, ctx->d_RDZN,
@@ -804,12 +978,7 @@ void gpu_compute_velocity_flux_(int* mesh_id,
     *ierr = GPU_SUCCESS;
 
 cleanup:
-    cudaFree(d_UU);
-    cudaFree(d_VV);
-    cudaFree(d_WW);
-    cudaFree(d_RHOP);
-    cudaFree(d_MU);
-    cudaFree(d_DP);
+    /* Only free output arrays - inputs are persistent */
     cudaFree(d_FVX);
     cudaFree(d_FVY);
     cudaFree(d_FVZ);
@@ -819,7 +988,9 @@ cleanup:
  * Advection Kernel Wrappers
  * ============================================================================ */
 
-/* Compute scalar advection on GPU */
+/* Compute scalar advection on GPU
+ * OPTIMIZED: Uses persistent GPU memory for velocity fields.
+ */
 void gpu_compute_advection_(int* mesh_id,
                              double* RHO_SCALAR,
                              double* UU, double* VV, double* WW,
@@ -836,30 +1007,29 @@ void gpu_compute_advection_(int* mesh_id,
     size_t n3d = calc_3d_size(ctx->ibar, ctx->jbar, ctx->kbar);
     size_t size_3d = n3d * sizeof(double);
 
-    /* Allocate temporary device arrays */
-    double *d_RHO_SCALAR, *d_UU, *d_VV, *d_WW, *d_U_DOT_DEL;
+    /* Use persistent velocity arrays */
+    int need_velocity_upload = !ctx->velocity_uploaded;
+    if (need_velocity_upload) {
+        cudaMemcpyAsync(ctx->d_UU, UU, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+        cudaMemcpyAsync(ctx->d_VV, VV, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+        cudaMemcpyAsync(ctx->d_WW, WW, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+        cudaStreamSynchronize(ctx->stream_upload);
+    }
 
+    /* Allocate only scalar and output arrays */
+    double *d_RHO_SCALAR, *d_U_DOT_DEL;
     cudaError_t err;
     err = cudaMalloc(&d_RHO_SCALAR, size_3d);
     if (err != cudaSuccess) { *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_UU, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO_SCALAR); *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_VV, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO_SCALAR); cudaFree(d_UU); *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_WW, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO_SCALAR); cudaFree(d_UU); cudaFree(d_VV); *ierr = GPU_ERROR; return; }
     err = cudaMalloc(&d_U_DOT_DEL, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO_SCALAR); cudaFree(d_UU); cudaFree(d_VV); cudaFree(d_WW); *ierr = GPU_ERROR; return; }
+    if (err != cudaSuccess) { cudaFree(d_RHO_SCALAR); *ierr = GPU_ERROR; return; }
 
-    /* Upload data */
+    /* Upload scalar data */
     cudaMemcpy(d_RHO_SCALAR, RHO_SCALAR, size_3d, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_UU, UU, size_3d, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_VV, VV, size_3d, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_WW, WW, size_3d, cudaMemcpyHostToDevice);
 
     /* Step 1: Compute advection fluxes */
     int result = gpu_advection_flux(
-        d_RHO_SCALAR, d_UU, d_VV, d_WW,
+        d_RHO_SCALAR, ctx->d_UU, ctx->d_VV, ctx->d_WW,
         ctx->d_FX, ctx->d_FY, ctx->d_FZ,
         *flux_limiter_type,
         ctx->ibar, ctx->jbar, ctx->kbar,
@@ -895,16 +1065,12 @@ void gpu_compute_advection_(int* mesh_id,
 
 cleanup:
     cudaFree(d_RHO_SCALAR);
-    cudaFree(d_UU);
-    cudaFree(d_VV);
-    cudaFree(d_WW);
     cudaFree(d_U_DOT_DEL);
 }
 
 /* Compute FDS-style enthalpy advection on GPU
+ * OPTIMIZED: Uses persistent GPU memory for velocity fields.
  * This matches ENTHALPY_ADVECTION_NEW formulation (FDS Tech Guide B.12-B.14)
- * NOTE: This version ignores SOLID cells and WALL_INDEX checks.
- * Use only for simple meshes without internal obstructions.
  */
 void gpu_compute_enthalpy_advection_(int* mesh_id,
                                       double* RHO_H_S_P,
@@ -922,38 +1088,30 @@ void gpu_compute_enthalpy_advection_(int* mesh_id,
     size_t n3d = calc_3d_size(ctx->ibar, ctx->jbar, ctx->kbar);
     size_t size_3d = n3d * sizeof(double);
 
-    /* Allocate temporary device arrays */
-    double *d_RHO_H_S_P, *d_UU, *d_VV, *d_WW, *d_U_DOT_DEL;
-    double *d_FX, *d_FY, *d_FZ;
+    /* Use persistent velocity arrays */
+    int need_velocity_upload = !ctx->velocity_uploaded;
+    if (need_velocity_upload) {
+        cudaMemcpyAsync(ctx->d_UU, UU, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+        cudaMemcpyAsync(ctx->d_VV, VV, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+        cudaMemcpyAsync(ctx->d_WW, WW, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+        cudaStreamSynchronize(ctx->stream_upload);
+    }
 
+    /* Allocate only scalar and output arrays */
+    double *d_RHO_H_S_P, *d_U_DOT_DEL;
     cudaError_t err;
     err = cudaMalloc(&d_RHO_H_S_P, size_3d);
     if (err != cudaSuccess) { *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_UU, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO_H_S_P); *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_VV, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO_H_S_P); cudaFree(d_UU); *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_WW, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO_H_S_P); cudaFree(d_UU); cudaFree(d_VV); *ierr = GPU_ERROR; return; }
     err = cudaMalloc(&d_U_DOT_DEL, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO_H_S_P); cudaFree(d_UU); cudaFree(d_VV); cudaFree(d_WW); *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_FX, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO_H_S_P); cudaFree(d_UU); cudaFree(d_VV); cudaFree(d_WW); cudaFree(d_U_DOT_DEL); *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_FY, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO_H_S_P); cudaFree(d_UU); cudaFree(d_VV); cudaFree(d_WW); cudaFree(d_U_DOT_DEL); cudaFree(d_FX); *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_FZ, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO_H_S_P); cudaFree(d_UU); cudaFree(d_VV); cudaFree(d_WW); cudaFree(d_U_DOT_DEL); cudaFree(d_FX); cudaFree(d_FY); *ierr = GPU_ERROR; return; }
+    if (err != cudaSuccess) { cudaFree(d_RHO_H_S_P); *ierr = GPU_ERROR; return; }
 
-    /* Upload data */
+    /* Upload scalar data */
     cudaMemcpy(d_RHO_H_S_P, RHO_H_S_P, size_3d, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_UU, UU, size_3d, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_VV, VV, size_3d, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_WW, WW, size_3d, cudaMemcpyHostToDevice);
 
-    /* Step 1: Compute face values with flux limiter */
+    /* Step 1: Compute face values with flux limiter - use context flux arrays */
     int result = gpu_advection_flux(
-        d_RHO_H_S_P, d_UU, d_VV, d_WW,
-        d_FX, d_FY, d_FZ,
+        d_RHO_H_S_P, ctx->d_UU, ctx->d_VV, ctx->d_WW,
+        ctx->d_FX, ctx->d_FY, ctx->d_FZ,
         *flux_limiter_type,
         ctx->ibar, ctx->jbar, ctx->kbar,
         ctx->stream
@@ -967,7 +1125,7 @@ void gpu_compute_enthalpy_advection_(int* mesh_id,
 
     /* Step 2: Compute FDS-style advection divergence */
     result = gpu_fds_advection_divergence(
-        d_FX, d_FY, d_FZ, d_RHO_H_S_P, d_UU, d_VV, d_WW,
+        ctx->d_FX, ctx->d_FY, ctx->d_FZ, d_RHO_H_S_P, ctx->d_UU, ctx->d_VV, ctx->d_WW,
         ctx->d_RDX, ctx->d_RDY, ctx->d_RDZ,
         d_U_DOT_DEL,
         ctx->ibar, ctx->jbar, ctx->kbar,
@@ -988,18 +1146,12 @@ void gpu_compute_enthalpy_advection_(int* mesh_id,
 
 cleanup:
     cudaFree(d_RHO_H_S_P);
-    cudaFree(d_UU);
-    cudaFree(d_VV);
-    cudaFree(d_WW);
     cudaFree(d_U_DOT_DEL);
-    cudaFree(d_FX);
-    cudaFree(d_FY);
-    cudaFree(d_FZ);
 }
 
 /* Compute species advection on GPU
+ * OPTIMIZED: Uses persistent GPU memory for velocity fields.
  * Same algorithm as enthalpy advection but for species mass fraction
- * Uses FDS Tech Guide B.12-B.14 formulation
  */
 void gpu_compute_species_advection_(int* mesh_id,
                                      double* RHO_Z_P,
@@ -1017,37 +1169,30 @@ void gpu_compute_species_advection_(int* mesh_id,
     size_t n3d = calc_3d_size(ctx->ibar, ctx->jbar, ctx->kbar);
     size_t size_3d = n3d * sizeof(double);
 
-    double *d_RHO_Z_P, *d_UU, *d_VV, *d_WW, *d_U_DOT_DEL;
-    double *d_FX, *d_FY, *d_FZ;
+    /* Use persistent velocity arrays */
+    int need_velocity_upload = !ctx->velocity_uploaded;
+    if (need_velocity_upload) {
+        cudaMemcpyAsync(ctx->d_UU, UU, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+        cudaMemcpyAsync(ctx->d_VV, VV, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+        cudaMemcpyAsync(ctx->d_WW, WW, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+        cudaStreamSynchronize(ctx->stream_upload);
+    }
 
+    /* Allocate only scalar and output arrays */
+    double *d_RHO_Z_P, *d_U_DOT_DEL;
     cudaError_t err;
     err = cudaMalloc(&d_RHO_Z_P, size_3d);
     if (err != cudaSuccess) { *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_UU, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO_Z_P); *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_VV, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO_Z_P); cudaFree(d_UU); *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_WW, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO_Z_P); cudaFree(d_UU); cudaFree(d_VV); *ierr = GPU_ERROR; return; }
     err = cudaMalloc(&d_U_DOT_DEL, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO_Z_P); cudaFree(d_UU); cudaFree(d_VV); cudaFree(d_WW); *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_FX, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO_Z_P); cudaFree(d_UU); cudaFree(d_VV); cudaFree(d_WW); cudaFree(d_U_DOT_DEL); *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_FY, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO_Z_P); cudaFree(d_UU); cudaFree(d_VV); cudaFree(d_WW); cudaFree(d_U_DOT_DEL); cudaFree(d_FX); *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_FZ, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO_Z_P); cudaFree(d_UU); cudaFree(d_VV); cudaFree(d_WW); cudaFree(d_U_DOT_DEL); cudaFree(d_FX); cudaFree(d_FY); *ierr = GPU_ERROR; return; }
+    if (err != cudaSuccess) { cudaFree(d_RHO_Z_P); *ierr = GPU_ERROR; return; }
 
-    /* Upload data */
+    /* Upload scalar data */
     cudaMemcpy(d_RHO_Z_P, RHO_Z_P, size_3d, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_UU, UU, size_3d, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_VV, VV, size_3d, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_WW, WW, size_3d, cudaMemcpyHostToDevice);
 
-    /* Step 1: Compute face values with flux limiter */
+    /* Step 1: Compute face values with flux limiter - use context flux arrays */
     int result = gpu_advection_flux(
-        d_RHO_Z_P, d_UU, d_VV, d_WW,
-        d_FX, d_FY, d_FZ,
+        d_RHO_Z_P, ctx->d_UU, ctx->d_VV, ctx->d_WW,
+        ctx->d_FX, ctx->d_FY, ctx->d_FZ,
         *flux_limiter_type,
         ctx->ibar, ctx->jbar, ctx->kbar,
         ctx->stream
@@ -1061,7 +1206,7 @@ void gpu_compute_species_advection_(int* mesh_id,
 
     /* Step 2: Compute FDS-style advection divergence */
     result = gpu_fds_advection_divergence(
-        d_FX, d_FY, d_FZ, d_RHO_Z_P, d_UU, d_VV, d_WW,
+        ctx->d_FX, ctx->d_FY, ctx->d_FZ, d_RHO_Z_P, ctx->d_UU, ctx->d_VV, ctx->d_WW,
         ctx->d_RDX, ctx->d_RDY, ctx->d_RDZ,
         d_U_DOT_DEL,
         ctx->ibar, ctx->jbar, ctx->kbar,
@@ -1082,16 +1227,11 @@ void gpu_compute_species_advection_(int* mesh_id,
 
 cleanup_species:
     cudaFree(d_RHO_Z_P);
-    cudaFree(d_UU);
-    cudaFree(d_VV);
-    cudaFree(d_WW);
     cudaFree(d_U_DOT_DEL);
-    cudaFree(d_FX);
-    cudaFree(d_FY);
-    cudaFree(d_FZ);
 }
 
 /* Compute density update for a single species on GPU
+ * OPTIMIZED: Uses persistent GPU memory for velocity fields.
  * ZZS = RHO * ZZ - DT * RHS
  * where RHS = -DEL_RHO_D_DEL_Z + div(FX*U, FY*V, FZ*W)
  * For Cartesian meshes only (R=RRN=1)
@@ -1115,14 +1255,21 @@ void gpu_compute_density_update_(int* mesh_id,
     size_t n3d = calc_3d_size(ctx->ibar, ctx->jbar, ctx->kbar);
     size_t size_3d = n3d * sizeof(double);
 
+    /* Use persistent velocity arrays */
+    int need_velocity_upload = !ctx->velocity_uploaded;
+    if (need_velocity_upload) {
+        cudaMemcpyAsync(ctx->d_UU, UU, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+        cudaMemcpyAsync(ctx->d_VV, VV, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+        cudaMemcpyAsync(ctx->d_WW, WW, size_3d, cudaMemcpyHostToDevice, ctx->stream_upload);
+        cudaStreamSynchronize(ctx->stream_upload);
+    }
+
+    /* Allocate only species-specific arrays */
     double *d_RHO, *d_ZZ, *d_DEL_RHO_D_DEL_Z;
     double *d_FX, *d_FY, *d_FZ;
-    double *d_UU, *d_VV, *d_WW;
     double *d_ZZS;
 
     cudaError_t err;
-
-    /* Allocate device arrays */
     err = cudaMalloc(&d_RHO, size_3d);
     if (err != cudaSuccess) { *ierr = GPU_ERROR; return; }
     err = cudaMalloc(&d_ZZ, size_3d);
@@ -1135,31 +1282,22 @@ void gpu_compute_density_update_(int* mesh_id,
     if (err != cudaSuccess) { cudaFree(d_RHO); cudaFree(d_ZZ); cudaFree(d_DEL_RHO_D_DEL_Z); cudaFree(d_FX); *ierr = GPU_ERROR; return; }
     err = cudaMalloc(&d_FZ, size_3d);
     if (err != cudaSuccess) { cudaFree(d_RHO); cudaFree(d_ZZ); cudaFree(d_DEL_RHO_D_DEL_Z); cudaFree(d_FX); cudaFree(d_FY); *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_UU, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO); cudaFree(d_ZZ); cudaFree(d_DEL_RHO_D_DEL_Z); cudaFree(d_FX); cudaFree(d_FY); cudaFree(d_FZ); *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_VV, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO); cudaFree(d_ZZ); cudaFree(d_DEL_RHO_D_DEL_Z); cudaFree(d_FX); cudaFree(d_FY); cudaFree(d_FZ); cudaFree(d_UU); *ierr = GPU_ERROR; return; }
-    err = cudaMalloc(&d_WW, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO); cudaFree(d_ZZ); cudaFree(d_DEL_RHO_D_DEL_Z); cudaFree(d_FX); cudaFree(d_FY); cudaFree(d_FZ); cudaFree(d_UU); cudaFree(d_VV); *ierr = GPU_ERROR; return; }
     err = cudaMalloc(&d_ZZS, size_3d);
-    if (err != cudaSuccess) { cudaFree(d_RHO); cudaFree(d_ZZ); cudaFree(d_DEL_RHO_D_DEL_Z); cudaFree(d_FX); cudaFree(d_FY); cudaFree(d_FZ); cudaFree(d_UU); cudaFree(d_VV); cudaFree(d_WW); *ierr = GPU_ERROR; return; }
+    if (err != cudaSuccess) { cudaFree(d_RHO); cudaFree(d_ZZ); cudaFree(d_DEL_RHO_D_DEL_Z); cudaFree(d_FX); cudaFree(d_FY); cudaFree(d_FZ); *ierr = GPU_ERROR; return; }
 
-    /* Upload data */
+    /* Upload species-specific data */
     cudaMemcpy(d_RHO, RHO, size_3d, cudaMemcpyHostToDevice);
     cudaMemcpy(d_ZZ, ZZ, size_3d, cudaMemcpyHostToDevice);
     cudaMemcpy(d_DEL_RHO_D_DEL_Z, DEL_RHO_D_DEL_Z, size_3d, cudaMemcpyHostToDevice);
     cudaMemcpy(d_FX, FX, size_3d, cudaMemcpyHostToDevice);
     cudaMemcpy(d_FY, FY, size_3d, cudaMemcpyHostToDevice);
     cudaMemcpy(d_FZ, FZ, size_3d, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_UU, UU, size_3d, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_VV, VV, size_3d, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_WW, WW, size_3d, cudaMemcpyHostToDevice);
 
-    /* Launch kernel */
+    /* Launch kernel - use persistent velocity arrays */
     int result = gpu_density_update(
         d_RHO, d_ZZ, d_DEL_RHO_D_DEL_Z,
         d_FX, d_FY, d_FZ,
-        d_UU, d_VV, d_WW,
+        ctx->d_UU, ctx->d_VV, ctx->d_WW,
         ctx->d_RDX, ctx->d_RDY, ctx->d_RDZ,
         *DT, d_ZZS,
         ctx->ibar, ctx->jbar, ctx->kbar,
@@ -1185,9 +1323,6 @@ cleanup_density:
     cudaFree(d_FX);
     cudaFree(d_FY);
     cudaFree(d_FZ);
-    cudaFree(d_UU);
-    cudaFree(d_VV);
-    cudaFree(d_WW);
     cudaFree(d_ZZS);
 }
 

@@ -701,6 +701,15 @@ MAIN_LOOP: DO
 
    FIRST_PASS = .TRUE.
 
+   ! Invalidate GPU persistent field caches at start of new timestep
+#ifdef WITH_GPU_KERNELS
+   IF (GPU_KERNELS_INITIALIZED) THEN
+      DO NM=LOWER_MESH_INDEX,UPPER_MESH_INDEX
+         CALL GPU_KERNEL_INVALIDATE_CACHE(NM, IERR)
+      ENDDO
+   ENDIF
+#endif
+
    CHANGE_TIME_STEP_LOOP: DO
 
       ! Predict species mass fractions at the next time step.
