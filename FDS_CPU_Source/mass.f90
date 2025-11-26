@@ -6,6 +6,7 @@ USE PRECISION_PARAMETERS
 USE GLOBAL_CONSTANTS
 USE MESH_POINTERS
 USE COMP_FUNCTIONS, ONLY: CURRENT_TIME
+USE GPU_FORTRAN, ONLY: GPU_COMPUTE_DENSITY_UPDATE
 
 IMPLICIT NONE (TYPE,EXTERNAL)
 PRIVATE
@@ -238,7 +239,8 @@ INTEGER, INTENT(IN) :: NM
 REAL(EB), INTENT(IN) :: T,DT
 REAL(EB) :: TNOW,RHS,Q_Z,XHAT,ZHAT
 REAL(EB), ALLOCATABLE, DIMENSION(:) :: ZZ_GET
-INTEGER :: I,J,K,N,IW
+INTEGER :: I,J,K,N,IW,IERR
+LOGICAL :: GPU_DENSITY_SUCCESS
 REAL(EB), POINTER, DIMENSION(:,:,:,:) :: DEL_RHO_D_DEL_Z__0
 REAL(EB), POINTER, DIMENSION(:,:,:) :: UU,VV,WW
 TYPE(WALL_TYPE), POINTER :: WC
@@ -301,26 +303,42 @@ CASE(.TRUE.) PREDICTOR_STEP
    ENDDO WALL_LOOP
    !$OMP END DO
 
-   ! Predictor step for mass density
+   !$OMP END PARALLEL
 
-   !$OMP DO PRIVATE(N,I,J,K,RHS)
-   DO N=1,N_TOTAL_SCALARS
-      DO K=1,KBAR
-         DO J=1,JBAR
-            DO I=1,IBAR
-               IF (CELL(CELL_INDEX(I,J,K))%SOLID) CYCLE
-               RHS = - DEL_RHO_D_DEL_Z__0(I,J,K,N) &
-                   + (FX(I,J,K,N)*UU(I,J,K)*R(I) - FX(I-1,J,K,N)*UU(I-1,J,K)*R(I-1))*RDX(I)*RRN(I) &
-                   + (FY(I,J,K,N)*VV(I,J,K)      - FY(I,J-1,K,N)*VV(I,J-1,K)       )*RDY(J)        &
-                   + (FZ(I,J,K,N)*WW(I,J,K)      - FZ(I,J,K-1,N)*WW(I,J,K-1)       )*RDZ(K)
-               ZZS(I,J,K,N) = RHO(I,J,K)*ZZ(I,J,K,N) - DT*RHS
+   ! Predictor step for mass density - GPU path for simple Cartesian meshes
+   GPU_DENSITY_SUCCESS = .FALSE.
+   IF (GPU_DENSITY_UPDATE .AND. GPU_KERNELS_INITIALIZED .AND. &
+       N_INTERNAL_WALL_CELLS == 0 .AND. .NOT.CC_IBM .AND. .NOT.CYLINDRICAL) THEN
+      ! GPU kernel processes one species at a time
+      DO N=1,N_TOTAL_SCALARS
+         CALL GPU_COMPUTE_DENSITY_UPDATE(NM, RHO, ZZ(:,:,:,N), DEL_RHO_D_DEL_Z__0(:,:,:,N), &
+              FX(:,:,:,N), FY(:,:,:,N), FZ(:,:,:,N), UU, VV, WW, DT, ZZS(:,:,:,N), IERR)
+         IF (IERR /= 0) EXIT
+      ENDDO
+      IF (IERR == 0) GPU_DENSITY_SUCCESS = .TRUE.
+   ENDIF
+
+   ! CPU path - fallback or for complex meshes
+   IF (.NOT.GPU_DENSITY_SUCCESS) THEN
+      !$OMP PARALLEL
+      !$OMP DO PRIVATE(N,I,J,K,RHS)
+      DO N=1,N_TOTAL_SCALARS
+         DO K=1,KBAR
+            DO J=1,JBAR
+               DO I=1,IBAR
+                  IF (CELL(CELL_INDEX(I,J,K))%SOLID) CYCLE
+                  RHS = - DEL_RHO_D_DEL_Z__0(I,J,K,N) &
+                      + (FX(I,J,K,N)*UU(I,J,K)*R(I) - FX(I-1,J,K,N)*UU(I-1,J,K)*R(I-1))*RDX(I)*RRN(I) &
+                      + (FY(I,J,K,N)*VV(I,J,K)      - FY(I,J-1,K,N)*VV(I,J-1,K)       )*RDY(J)        &
+                      + (FZ(I,J,K,N)*WW(I,J,K)      - FZ(I,J,K-1,N)*WW(I,J,K-1)       )*RDZ(K)
+                  ZZS(I,J,K,N) = RHO(I,J,K)*ZZ(I,J,K,N) - DT*RHS
+               ENDDO
             ENDDO
          ENDDO
       ENDDO
-   ENDDO
-   !$OMP END DO
-
-   !$OMP END PARALLEL
+      !$OMP END DO
+      !$OMP END PARALLEL
+   ENDIF
 
    IF (CC_IBM) CALL SET_EXIMADVFLX_3D(NM,UU,VV,WW)
    IF (STORE_SPECIES_FLUX) THEN

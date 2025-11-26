@@ -47,6 +47,10 @@ USE LOCMAT_SOLVER, ONLY : ULMAT_SOLVER,ULMAT_SOLVER_SETUP,FINISH_ULMAT_SOLVER
 #ifdef WITH_AMGX
 USE AMGX_FORTRAN
 #endif
+#ifdef WITH_GPU_KERNELS
+USE GPU_FORTRAN
+USE GPU_DATA_FORTRAN
+#endif
 
 IMPLICIT NONE (TYPE,EXTERNAL)
 
@@ -111,6 +115,21 @@ ELSE
          WRITE(LU_ERR,'(A,F8.1,A,F8.1,A)') ' GPU Memory      : ', GPU_MEM_USED, ' / ', GPU_MEM_TOTAL, ' MB'
       END BLOCK
    ENDIF
+ENDIF
+#endif
+
+! Initialize GPU kernels for advection/diffusion acceleration
+#ifdef WITH_GPU_KERNELS
+CALL GPU_DATA_MANAGER_INIT(IERR)
+IF (IERR /= 0 .AND. MY_RANK == 0) THEN
+   WRITE(LU_ERR,'(A)') ' WARNING: GPU Data Manager initialization failed'
+ENDIF
+CALL GPU_KERNEL_INIT(IERR)
+IF (IERR /= 0 .AND. MY_RANK == 0) THEN
+   WRITE(LU_ERR,'(A)') ' WARNING: GPU Kernel initialization failed'
+ELSE
+   IF (MY_RANK == 0) WRITE(LU_ERR,'(A)') ' GPU Kernels     : Advection + Diffusion enabled'
+   GPU_KERNELS_INITIALIZED = .TRUE.
 ENDIF
 #endif
 
@@ -294,6 +313,30 @@ DO NM=LOWER_MESH_INDEX,UPPER_MESH_INDEX
 ENDDO
 
 IF (MY_RANK==0 .AND. VERBOSE) CALL VERBOSE_PRINTOUT('Completed INITIALIZE_MESH_VARIABLES_2')
+
+! Allocate GPU memory for each mesh (after mesh dimensions are set)
+#ifdef WITH_GPU_KERNELS
+IF (GPU_KERNELS_INITIALIZED) THEN
+   DO NM=LOWER_MESH_INDEX,UPPER_MESH_INDEX
+      CALL GPU_ALLOCATE_MESH(NM, MESHES(NM)%IBAR, MESHES(NM)%JBAR, MESHES(NM)%KBAR, N_TOTAL_SCALARS, IERR)
+      IF (IERR /= 0) THEN
+         WRITE(LU_ERR,'(A,I4)') ' WARNING: GPU mesh allocation failed for mesh ', NM
+      ENDIF
+      CALL GPU_KERNEL_ALLOCATE_MESH(NM, MESHES(NM)%IBAR, MESHES(NM)%JBAR, MESHES(NM)%KBAR, N_TOTAL_SCALARS, IERR)
+      IF (IERR /= 0) THEN
+         WRITE(LU_ERR,'(A,I4)') ' WARNING: GPU kernel allocation failed for mesh ', NM
+      ENDIF
+      ! Upload grid spacing parameters to GPU
+      CALL GPU_KERNEL_UPLOAD_GRID(NM, MESHES(NM)%RDX, MESHES(NM)%RDY, MESHES(NM)%RDZ, &
+                                  MESHES(NM)%RDXN, MESHES(NM)%RDYN, MESHES(NM)%RDZN, &
+                                  MESHES(NM)%RHO_0, IERR)
+      IF (IERR /= 0) THEN
+         WRITE(LU_ERR,'(A,I4)') ' WARNING: GPU grid upload failed for mesh ', NM
+      ENDIF
+   ENDDO
+   IF (MY_RANK==0 .AND. VERBOSE) CALL VERBOSE_PRINTOUT('Completed GPU mesh allocation')
+ENDIF
+#endif
 
 ! Create arrays and communicators to exchange back WALL and THIN_WALL arrays across mesh boundaries.
 ! In the first call to the subroutine, all the WALL cells that are HT3D need to be exchanged, but once the 3-D noding is 
@@ -1807,6 +1850,14 @@ DO I=1,N_REQ14 ; CALL MPI_REQUEST_FREE(REQ14(I),IERR) ; ENDDO
 IF (EXCHANGE_OBST_MASS) THEN
    DO I=1,N_REQ15 ; CALL MPI_REQUEST_FREE(REQ15(I),IERR) ; ENDDO
 ENDIF
+
+! Shutdown GPU kernels for advection/diffusion
+#ifdef WITH_GPU_KERNELS
+IF (GPU_KERNELS_INITIALIZED) THEN
+   CALL GPU_KERNEL_FINALIZE(IERR)
+   CALL GPU_DATA_MANAGER_FINALIZE(IERR)
+ENDIF
+#endif
 
 ! Shutdown AmgX and GPU monitoring (must be before MPI_FINALIZE)
 #ifdef WITH_AMGX

@@ -542,6 +542,16 @@ INTEGER :: UGLMAT_SOLVER_LIBRARY=MKL_CPARDISO_FLAG               !< Integer UGLM
 INTEGER :: PRES_FLAG = FFT_FLAG                                  !< Pressure solver
 LOGICAL :: TUNNEL_PRECONDITIONER=.FALSE.                         !< Use special pressure preconditioner for tunnels
 LOGICAL :: FORCE_GPU_SOLVER=.FALSE.                              !< Force GPU solver even when FFT would work
+
+! GPU Kernel Flags for Advection/Diffusion acceleration
+LOGICAL :: GPU_ADVECTION=.TRUE.                                  !< Enable GPU-accelerated advection kernels
+LOGICAL :: GPU_DIFFUSION=.TRUE.                                  !< Enable GPU-accelerated diffusion kernels
+LOGICAL :: GPU_VELOCITY_FLUX=.TRUE.                              !< Enable GPU-accelerated velocity flux kernels
+LOGICAL :: GPU_DENSITY_UPDATE=.TRUE.                             !< Enable GPU-accelerated density update kernels
+INTEGER :: GPU_MIN_CELLS=0                                       !< Minimum mesh cells for GPU kernel activation (0=always use GPU)
+CHARACTER(10) :: GPU_MODE='FORCE'                                !< GPU mode: 'AUTO', 'FORCE', 'OFF'
+LOGICAL :: GPU_KERNELS_INITIALIZED=.FALSE.                       !< Flag indicating GPU kernels are initialized
+
 INTEGER :: TUNNEL_NXP                                            !< Number of x points in the entire tunnel
 REAL(EB), ALLOCATABLE, DIMENSION(:) :: TP_AA                     !< Upper off-diagonal of tri-diagonal matrix for tunnel pressure
 REAL(EB), ALLOCATABLE, DIMENSION(:) :: TP_BB                     !< Lower off-diagonal of tri-diagonal matrix for tunnel pressure

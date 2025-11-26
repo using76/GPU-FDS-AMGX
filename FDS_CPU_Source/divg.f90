@@ -3,6 +3,9 @@ MODULE DIVG
 USE PRECISION_PARAMETERS
 USE GLOBAL_CONSTANTS
 USE MESH_POINTERS
+#ifdef WITH_GPU_KERNELS
+USE GPU_FORTRAN
+#endif
 
 IMPLICIT NONE (TYPE,EXTERNAL)
 PRIVATE
@@ -40,7 +43,7 @@ REAL(EB), POINTER, DIMENSION(:,:,:,:) :: RHO_D_DZDX,RHO_D_DZDY,RHO_D_DZDZ
 REAL(EB), POINTER, DIMENSION(:,:) :: PBAR_P
 REAL(EB) :: DELKDELT,VC,VC1,DTDX,DTDY,DTDZ,TNOW,DZDX,DZDY,DZDZ,TMP_G,DIV_DIFF_HEAT_FLUX,H_S,XHAT,ZHAT,TT,Q_Z,&
             D_Z_TEMP,D_Z_N(0:I_MAX_TEMP),RHO_D_DZDN_GET(1:N_TRACKED_SPECIES),UN_P,TMP_F_GAS,R_PFCT,RHO_D_DZDN
-INTEGER :: IW,N,I,J,K,IPZ,N_ZZ_MAX,ICF
+INTEGER :: IW,N,I,J,K,IPZ,N_ZZ_MAX,ICF,IERR
 REAL(EB), ALLOCATABLE, DIMENSION(:) :: ZZ_GET
 TYPE(SPECIES_MIXTURE_TYPE), POINTER :: SM
 TYPE(WALL_TYPE), POINTER :: WC
@@ -166,21 +169,33 @@ SPECIES_GT_1_IF: IF (N_TOTAL_SCALARS>1) THEN
       ENDIF
 
       ! Compute rho*D del Z
-
-      !$OMP PARALLEL DO PRIVATE(DZDX, DZDY, DZDZ) SCHEDULE (STATIC)
-      DO K=0,KBAR
-         DO J=0,JBAR
-            DO I=0,IBAR
-               DZDX = (ZZP(I+1,J,K,N)-ZZP(I,J,K,N))*RDXN(I)
-               RHO_D_DZDX(I,J,K,N) = .5_EB*(RHO_D(I+1,J,K)+RHO_D(I,J,K))*DZDX
-               DZDY = (ZZP(I,J+1,K,N)-ZZP(I,J,K,N))*RDYN(J)
-               RHO_D_DZDY(I,J,K,N) = .5_EB*(RHO_D(I,J+1,K)+RHO_D(I,J,K))*DZDY
-               DZDZ = (ZZP(I,J,K+1,N)-ZZP(I,J,K,N))*RDZN(K)
-               RHO_D_DZDZ(I,J,K,N) = .5_EB*(RHO_D(I,J,K+1)+RHO_D(I,J,K))*DZDZ
+#ifdef WITH_GPU_KERNELS
+      IF (GPU_DIFFUSION .AND. GPU_KERNELS_INITIALIZED) THEN
+         ! GPU path: compute species diffusion flux for this species
+         CALL GPU_COMPUTE_SPECIES_DIFFUSION_SINGLE(NM, ZZP(:,:,:,N), RHO_D, &
+              RHO_D_DZDX(:,:,:,N), RHO_D_DZDY(:,:,:,N), RHO_D_DZDZ(:,:,:,N), IERR)
+         IF (IERR /= 0) GOTO 200  ! Fallback to CPU on error
+      ELSE
+200   CONTINUE
+#endif
+         ! CPU path: OpenMP parallel loop
+         !$OMP PARALLEL DO PRIVATE(DZDX, DZDY, DZDZ) SCHEDULE (STATIC)
+         DO K=0,KBAR
+            DO J=0,JBAR
+               DO I=0,IBAR
+                  DZDX = (ZZP(I+1,J,K,N)-ZZP(I,J,K,N))*RDXN(I)
+                  RHO_D_DZDX(I,J,K,N) = .5_EB*(RHO_D(I+1,J,K)+RHO_D(I,J,K))*DZDX
+                  DZDY = (ZZP(I,J+1,K,N)-ZZP(I,J,K,N))*RDYN(J)
+                  RHO_D_DZDY(I,J,K,N) = .5_EB*(RHO_D(I,J+1,K)+RHO_D(I,J,K))*DZDY
+                  DZDZ = (ZZP(I,J,K+1,N)-ZZP(I,J,K,N))*RDZN(K)
+                  RHO_D_DZDZ(I,J,K,N) = .5_EB*(RHO_D(I,J,K+1)+RHO_D(I,J,K))*DZDZ
+               ENDDO
             ENDDO
          ENDDO
-      ENDDO
-      !$OMP END PARALLEL DO
+         !$OMP END PARALLEL DO
+#ifdef WITH_GPU_KERNELS
+      ENDIF
+#endif
 
       ! If tensor diffusivity, add turbulent scalar flux to rho*D del Z
 
@@ -508,20 +523,35 @@ ENDIF
 
 ! Compute k*dT/dx, etc
 
-!$OMP PARALLEL DO PRIVATE(DTDX, DTDY, DTDZ) SCHEDULE(STATIC)
-DO K=0,KBAR
-   DO J=0,JBAR
-      DO I=0,IBAR
-         DTDX = (TMP(I+1,J,K)-TMP(I,J,K))*RDXN(I)
-         KDTDX(I,J,K) = .5_EB*(KP(I+1,J,K)+KP(I,J,K))*DTDX
-         DTDY = (TMP(I,J+1,K)-TMP(I,J,K))*RDYN(J)
-         KDTDY(I,J,K) = .5_EB*(KP(I,J+1,K)+KP(I,J,K))*DTDY
-         DTDZ = (TMP(I,J,K+1)-TMP(I,J,K))*RDZN(K)
-         KDTDZ(I,J,K) = .5_EB*(KP(I,J,K+1)+KP(I,J,K))*DTDZ
+#ifdef WITH_GPU_KERNELS
+IF (GPU_DIFFUSION .AND. GPU_KERNELS_INITIALIZED) THEN
+   ! GPU path: compute thermal diffusion flux on GPU
+   CALL GPU_COMPUTE_THERMAL_DIFFUSION(NM, TMP, KP, KDTDX, KDTDY, KDTDZ, IERR)
+   IF (IERR /= 0) THEN
+      ! Fallback to CPU on error
+      GOTO 100
+   ENDIF
+ELSE
+100 CONTINUE
+#endif
+   ! CPU path: OpenMP parallel loop
+   !$OMP PARALLEL DO PRIVATE(DTDX, DTDY, DTDZ) SCHEDULE(STATIC)
+   DO K=0,KBAR
+      DO J=0,JBAR
+         DO I=0,IBAR
+            DTDX = (TMP(I+1,J,K)-TMP(I,J,K))*RDXN(I)
+            KDTDX(I,J,K) = .5_EB*(KP(I+1,J,K)+KP(I,J,K))*DTDX
+            DTDY = (TMP(I,J+1,K)-TMP(I,J,K))*RDYN(J)
+            KDTDY(I,J,K) = .5_EB*(KP(I,J+1,K)+KP(I,J,K))*DTDY
+            DTDZ = (TMP(I,J,K+1)-TMP(I,J,K))*RDZN(K)
+            KDTDZ(I,J,K) = .5_EB*(KP(I,J,K+1)+KP(I,J,K))*DTDZ
+         ENDDO
       ENDDO
    ENDDO
-ENDDO
-!$OMP END PARALLEL DO
+   !$OMP END PARALLEL DO
+#ifdef WITH_GPU_KERNELS
+ENDIF
+#endif
 
 ! If tensor diffusivity, add turbulent thermal scalar flux to k*dT/dx, etc
 
@@ -583,6 +613,15 @@ CASE(.TRUE.) CYLINDER3   ! 2D Cylindrical
 END SELECT CYLINDER3
 
 ! Compute U_DOT_DEL_RHO_H_S and add to other enthalpy equation source terms
+!
+! GPU advection acceleration notes:
+! GPU_COMPUTE_ADVECTION kernel is available with SUPERBEE/CHARM flux limiters.
+! Current limitations for full integration:
+! 1. GET_SENSIBLE_ENTHALPY requires temperature-dependent table lookup per cell
+! 2. CELL(IC)%SOLID and CELL(IC)%WALL_INDEX checks need geometry data on GPU
+! 3. Wall boundary conditions in WALL_LOOP need irregular memory access
+! For now, use optimized OpenMP CPU path. GPU path can be enabled for simple
+! meshes without internal obstructions by adding GPU_ADVECTION flag check.
 
 CONST_GAMMA_IF_1: IF (.NOT.CONSTANT_SPECIFIC_HEAT_RATIO) THEN
 
@@ -794,11 +833,13 @@ REAL(EB) :: UN,UN_P,TMP_F_GAS,DU_P,DU_M,DV_P,DV_M,DW_P,DW_M,DU,H_S
 REAL(EB), ALLOCATABLE, DIMENSION(:) :: ZZ_GET
 REAL(EB), DIMENSION(0:3,0:3,0:3) :: U_TEMP,F_TEMP,B_TEMP
 REAL(EB), DIMENSION(-1:3,-1:3,-1:3) :: Z_TEMP
-INTEGER :: IC,I,J,K,IW
+INTEGER :: IC,I,J,K,IW,IERR
+LOGICAL :: GPU_USED
 TYPE(WALL_TYPE), POINTER :: WC
 TYPE(BOUNDARY_COORD_TYPE), POINTER :: BC
 TYPE(BOUNDARY_PROP1_TYPE), POINTER :: B1
 
+GPU_USED = .FALSE.
 RHO_H_S_P=>WORK_PAD ; RHO_H_S_P = 0._EB
 FX_H_S=>WORK2    ; FX_H_S = 0._EB
 FY_H_S=>WORK3    ; FY_H_S = 0._EB
@@ -827,6 +868,23 @@ ENDDO
 DEALLOCATE(ZZ_GET)
 !$OMP END PARALLEL
 
+#ifdef WITH_GPU_KERNELS
+! GPU-accelerated enthalpy advection
+! NOTE: GPU path ignores SOLID cells and WALL_INDEX. Only valid for simple meshes.
+! The WALL_LOOP still provides boundary corrections after GPU computation.
+IF (GPU_ADVECTION .AND. GPU_KERNELS_INITIALIZED .AND. N_INTERNAL_WALL_CELLS == 0) THEN
+   CALL GPU_COMPUTE_ENTHALPY_ADVECTION(NM, RHO_H_S_P, UU, VV, WW, &
+        U_DOT_DEL_RHO_H_S, I_FLUX_LIMITER, IERR)
+   IF (IERR == 0) THEN
+      GPU_USED = .TRUE.
+      ! GPU succeeded - skip CPU face values and interior loop
+      ! Still need to run WALL_LOOP for external wall corrections
+      GOTO 500
+   ENDIF
+   ! GPU failed - fall back to CPU path
+ENDIF
+#endif
+
 ! Compute scalar face values
 
 CALL GET_SCALAR_FACE_COEF(UU,RHO_H_S_P,BFX,0,IBAR,1,JBAR,1,KBAR,1,I_FLUX_LIMITER)
@@ -836,6 +894,11 @@ CALL GET_SCALAR_FACE_COEF(WW,RHO_H_S_P,BFZ,1,IBAR,1,JBAR,0,KBAR,3,I_FLUX_LIMITER
 CALL GET_SCALAR_FACE_VALUE_NEW(UU,RHO_H_S_P,FX_H_S,BFX,0,IBAR,1,JBAR,1,KBAR,1,I_FLUX_LIMITER)
 CALL GET_SCALAR_FACE_VALUE_NEW(VV,RHO_H_S_P,FY_H_S,BFY,1,IBAR,0,JBAR,1,KBAR,2,I_FLUX_LIMITER)
 CALL GET_SCALAR_FACE_VALUE_NEW(WW,RHO_H_S_P,FZ_H_S,BFZ,1,IBAR,1,JBAR,0,KBAR,3,I_FLUX_LIMITER)
+
+#ifdef WITH_GPU_KERNELS
+! GPU path jumps here to still run WALL_LOOP for boundary corrections
+500 CONTINUE
+#endif
 
 ALLOCATE(ZZ_GET(1:N_TRACKED_SPECIES))
 
@@ -951,7 +1014,9 @@ ENDDO WALL_LOOP
 DEALLOCATE(ZZ_GET)
 
 ! FDS Tech Guide (B.12-B.14)
+! Skip CPU interior loop if GPU already computed it
 
+IF (.NOT. GPU_USED) THEN
 !$OMP PARALLEL DO PRIVATE(IC,DU_P,DU_M,DV_P,DV_M,DW_P,DW_M)
 DO K=1,KBAR
    DO J=1,JBAR
@@ -975,6 +1040,7 @@ DO K=1,KBAR
    ENDDO
 ENDDO
 !$OMP END PARALLEL DO
+ENDIF
 
 END SUBROUTINE ENTHALPY_ADVECTION_NEW
 
@@ -1128,16 +1194,47 @@ SUBROUTINE SPECIES_ADVECTION_PART_2(N,U_DOT_DEL_RHO_Z)
 INTEGER, INTENT(IN) :: N
 REAL(EB), POINTER, DIMENSION(:,:,:) :: U_DOT_DEL_RHO_Z
 REAL(EB), POINTER, DIMENSION(:,:,:,:) :: FX_ZZ,FY_ZZ,FZ_ZZ
+REAL(EB), POINTER, DIMENSION(:,:,:) :: RHO_Z_P
 REAL(EB) :: UN,DU_P,DU_M,DV_P,DV_M,DW_P,DW_M,DU
-INTEGER :: IC,I,J,K,IW
+INTEGER :: IC,I,J,K,IW,IERR
+LOGICAL :: GPU_USED
 TYPE(WALL_TYPE), POINTER :: WC
 TYPE(BOUNDARY_COORD_TYPE), POINTER :: BC
 TYPE(BOUNDARY_PROP1_TYPE), POINTER :: B1
 
+GPU_USED = .FALSE.
 FX_ZZ=>SWORK1
 FY_ZZ=>SWORK2
 FZ_ZZ=>SWORK3
 U_DOT_DEL_RHO_Z=>WORK7 ; U_DOT_DEL_RHO_Z = 0._EB
+
+#ifdef WITH_GPU_KERNELS
+! GPU-accelerated species advection
+! NOTE: GPU path ignores SOLID cells and WALL_INDEX. Only valid for simple meshes.
+IF (GPU_ADVECTION .AND. GPU_KERNELS_INITIALIZED .AND. N_INTERNAL_WALL_CELLS == 0) THEN
+   ! Compute RHO_Z_P = RHOP * ZZP(:,:,:,N) for GPU
+   RHO_Z_P => WORK_PAD
+   !$OMP PARALLEL DO PRIVATE(I,J,K)
+   DO K = -1, KBP1+1
+      DO J = -1, JBP1+1
+         DO I = -1, IBP1+1
+            RHO_Z_P(I,J,K) = RHOP(I,J,K) * ZZP(I,J,K,N)
+         END DO
+      END DO
+   END DO
+   !$OMP END PARALLEL DO
+
+   CALL GPU_COMPUTE_SPECIES_ADVECTION(NM, RHO_Z_P, UU, VV, WW, &
+        U_DOT_DEL_RHO_Z, I_FLUX_LIMITER, IERR)
+   IF (IERR == 0) THEN
+      GPU_USED = .TRUE.
+      ! GPU succeeded - skip to WALL_LOOP for boundary corrections
+      GOTO 600
+   ENDIF
+   ! GPU failed - fall back to CPU path
+ENDIF
+600 CONTINUE
+#endif
 
 WALL_LOOP: DO IW=1,N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS
 
@@ -1170,6 +1267,8 @@ WALL_LOOP: DO IW=1,N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS
 
 ENDDO WALL_LOOP
 
+! Skip CPU interior loop if GPU already computed it
+IF (.NOT. GPU_USED) THEN
 !$OMP PARALLEL DO PRIVATE(IC,DU_P,DU_M,DV_P,DV_M,DW_P,DW_M)
 DO K=1,KBAR
    DO J=1,JBAR
@@ -1193,6 +1292,7 @@ DO K=1,KBAR
    ENDDO
 ENDDO
 !$OMP END PARALLEL DO
+ENDIF
 
 END SUBROUTINE SPECIES_ADVECTION_PART_2
 

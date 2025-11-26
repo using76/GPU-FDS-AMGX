@@ -7,6 +7,9 @@ USE PRECISION_PARAMETERS
 USE GLOBAL_CONSTANTS
 USE MESH_POINTERS
 USE COMP_FUNCTIONS, ONLY: CURRENT_TIME
+#ifdef WITH_GPU_KERNELS
+USE GPU_FORTRAN
+#endif
 
 IMPLICIT NONE (TYPE,EXTERNAL)
 PRIVATE
@@ -581,7 +584,8 @@ REAL(EB) :: MUX,MUY,MUZ,UP,UM,VP,VM,WP,WM,VTRM,OMXP,OMXM,OMYP,OMYM,OMZP,OMZM,TXY
             DUDX,DVDY,DWDZ,DUDY,DUDZ,DVDX,DVDZ,DWDX,DWDY, &
             VOMZ,WOMY,UOMY,VOMX,UOMZ,WOMX, &
             RRHO,GX(0:IBAR_MAX),GY(0:IBAR_MAX),GZ(0:IBAR_MAX),TXXP,TXXM,TYYP,TYYM,TZZP,TZZM,DTXXDX,DTYYDY,DTZZDZ,T_NOW
-INTEGER :: I,J,K,IEXP,IEXM,IEYP,IEYM,IEZP,IEZM,IC,IC1,IC2
+INTEGER :: I,J,K,IEXP,IEXM,IEYP,IEYM,IEZP,IEZM,IC,IC1,IC2,IERR
+LOGICAL :: GPU_FULL_PATH
 REAL(EB), POINTER, DIMENSION(:,:,:) :: TXY,TXZ,TYZ,OMX,OMY,OMZ,UU,VV,WW,RHOP,DP
 
 T_NOW=CURRENT_TIME()
@@ -609,6 +613,8 @@ OMX => WORK4
 OMY => WORK5
 OMZ => WORK6
 
+GPU_FULL_PATH = .FALSE.
+
 ! Define velocities on gas cut-faces underlaying Cartesian faces.
 
 IF (CC_IBM) THEN
@@ -621,30 +627,76 @@ IF (CC_IBM) THEN
 ENDIF
 
 ! Compute vorticity and stress tensor components
+!
+! GPU acceleration: For simple meshes without internal walls, the full
+! velocity flux computation (vorticity/stress + FVX/FVY/FVZ) can run on GPU.
+! For complex meshes, only vorticity/stress runs on GPU.
 
-!$OMP PARALLEL DO PRIVATE(DUDY,DVDX,DUDZ,DWDX,DVDZ,DWDY,MUX,MUY,MUZ) SCHEDULE(STATIC)
-DO K=0,KBAR
-   DO J=0,JBAR
+#ifdef WITH_GPU_KERNELS
+! Full GPU path: computes vorticity/stress AND FVX/FVY/FVZ
+! Only for simple meshes without internal obstructions
+IF (GPU_VELOCITY_FLUX .AND. GPU_KERNELS_INITIALIZED .AND. N_INTERNAL_WALL_CELLS == 0 .AND. .NOT.CC_IBM) THEN
+   ! Compute gravity components first (needed for GPU)
+   IF (.NOT.SPATIAL_GRAVITY_VARIATION) THEN
+      GX(0:IBAR) = EVALUATE_RAMP(T,I_RAMP_GX)*GVEC(1)
+      GY(0:IBAR) = EVALUATE_RAMP(T,I_RAMP_GY)*GVEC(2)
+      GZ(0:IBAR) = EVALUATE_RAMP(T,I_RAMP_GZ)*GVEC(3)
+   ELSE
       DO I=0,IBAR
-         DUDY = RDYN(J)*(UU(I,J+1,K)-UU(I,J,K))
-         DVDX = RDXN(I)*(VV(I+1,J,K)-VV(I,J,K))
-         DUDZ = RDZN(K)*(UU(I,J,K+1)-UU(I,J,K))
-         DWDX = RDXN(I)*(WW(I+1,J,K)-WW(I,J,K))
-         DVDZ = RDZN(K)*(VV(I,J,K+1)-VV(I,J,K))
-         DWDY = RDYN(J)*(WW(I,J+1,K)-WW(I,J,K))
-         OMX(I,J,K) = DWDY - DVDZ
-         OMY(I,J,K) = DUDZ - DWDX
-         OMZ(I,J,K) = DVDX - DUDY
-         MUX = 0.25_EB*(MU(I,J+1,K)+MU(I,J,K)+MU(I,J,K+1)+MU(I,J+1,K+1))
-         MUY = 0.25_EB*(MU(I+1,J,K)+MU(I,J,K)+MU(I,J,K+1)+MU(I+1,J,K+1))
-         MUZ = 0.25_EB*(MU(I+1,J,K)+MU(I,J,K)+MU(I,J+1,K)+MU(I+1,J+1,K))
-         TXY(I,J,K) = MUZ*(DVDX + DUDY)
-         TXZ(I,J,K) = MUY*(DUDZ + DWDX)
-         TYZ(I,J,K) = MUX*(DVDZ + DWDY)
+         GX(I) = EVALUATE_RAMP(X(I),I_RAMP_GX)*GVEC(1)
+         GY(I) = EVALUATE_RAMP(X(I),I_RAMP_GY)*GVEC(2)
+         GZ(I) = EVALUATE_RAMP(X(I),I_RAMP_GZ)*GVEC(3)
+      ENDDO
+   ENDIF
+   ! Upload gravity to GPU
+   CALL GPU_KERNEL_UPLOAD_GRAVITY(NM, GX, GY, GZ, IERR)
+   IF (IERR /= 0) GOTO 300
+
+   ! Full GPU computation: vorticity/stress + FVX/FVY/FVZ
+   CALL GPU_COMPUTE_VELOCITY_FLUX(NM, UU, VV, WW, RHOP, MU, DP, FVX, FVY, FVZ, IERR)
+   IF (IERR == 0) THEN
+      GPU_FULL_PATH = .TRUE.
+      GOTO 400  ! Skip all CPU computation
+   ENDIF
+   ! Fallback to partial GPU on error
+ENDIF
+
+! Partial GPU path: only vorticity/stress on GPU
+IF (GPU_VELOCITY_FLUX .AND. GPU_KERNELS_INITIALIZED .AND. .NOT.GPU_FULL_PATH) THEN
+   ! GPU path: compute vorticity and stress tensor on GPU
+   CALL GPU_COMPUTE_VORTICITY_STRESS(NM, UU, VV, WW, MU, &
+        OMX, OMY, OMZ, TXY, TXZ, TYZ, IERR)
+   IF (IERR /= 0) GOTO 300  ! Fallback to CPU on error
+ELSE
+300 CONTINUE
+#endif
+   ! CPU path: OpenMP parallel loop
+   !$OMP PARALLEL DO PRIVATE(DUDY,DVDX,DUDZ,DWDX,DVDZ,DWDY,MUX,MUY,MUZ) SCHEDULE(STATIC)
+   DO K=0,KBAR
+      DO J=0,JBAR
+         DO I=0,IBAR
+            DUDY = RDYN(J)*(UU(I,J+1,K)-UU(I,J,K))
+            DVDX = RDXN(I)*(VV(I+1,J,K)-VV(I,J,K))
+            DUDZ = RDZN(K)*(UU(I,J,K+1)-UU(I,J,K))
+            DWDX = RDXN(I)*(WW(I+1,J,K)-WW(I,J,K))
+            DVDZ = RDZN(K)*(VV(I,J,K+1)-VV(I,J,K))
+            DWDY = RDYN(J)*(WW(I,J+1,K)-WW(I,J,K))
+            OMX(I,J,K) = DWDY - DVDZ
+            OMY(I,J,K) = DUDZ - DWDX
+            OMZ(I,J,K) = DVDX - DUDY
+            MUX = 0.25_EB*(MU(I,J+1,K)+MU(I,J,K)+MU(I,J,K+1)+MU(I,J+1,K+1))
+            MUY = 0.25_EB*(MU(I+1,J,K)+MU(I,J,K)+MU(I,J,K+1)+MU(I+1,J,K+1))
+            MUZ = 0.25_EB*(MU(I+1,J,K)+MU(I,J,K)+MU(I,J+1,K)+MU(I+1,J+1,K))
+            TXY(I,J,K) = MUZ*(DVDX + DUDY)
+            TXZ(I,J,K) = MUY*(DUDZ + DWDX)
+            TYZ(I,J,K) = MUX*(DVDZ + DWDY)
+         ENDDO
       ENDDO
    ENDDO
-ENDDO
-!$OMP END PARALLEL DO
+   !$OMP END PARALLEL DO
+#ifdef WITH_GPU_KERNELS
+ENDIF
+#endif
 
 ! Compute gravity components
 
@@ -838,6 +890,10 @@ ENDDO
 !$OMP END DO NOWAIT
 
 !$OMP END PARALLEL
+
+#ifdef WITH_GPU_KERNELS
+400 CONTINUE  ! GPU full path jumps here
+#endif
 
 ! Additional force terms
 
