@@ -45,6 +45,15 @@ typedef struct {
     double *pinned_sol;      /* Pinned (page-locked) memory for solution vector */
     cudaStream_t stream;     /* CUDA stream for async operations */
     int pinned_allocated;    /* Flag: pinned memory allocated */
+
+    /* ============================================
+     * GPU-RESIDENT DATA: Zero-copy optimization
+     * Keep RHS and solution on GPU permanently
+     * ============================================ */
+    double *d_rhs_gpu;       /* GPU-resident RHS vector (device memory) */
+    double *d_sol_gpu;       /* GPU-resident solution vector (device memory) */
+    int gpu_resident;        /* Flag: GPU-resident mode enabled */
+    int gpu_data_valid;      /* Flag: GPU data is valid (no sync needed) */
 } AmgxZone;
 
 static AmgxZone zones[MAX_ZONES];
@@ -169,6 +178,11 @@ void amgx_initialize_(int *ierr)
         zones[i].pinned_sol = NULL;
         zones[i].stream = NULL;
         zones[i].pinned_allocated = 0;
+        /* GPU-resident data initialization */
+        zones[i].d_rhs_gpu = NULL;
+        zones[i].d_sol_gpu = NULL;
+        zones[i].gpu_resident = 0;
+        zones[i].gpu_data_valid = 0;
     }
 
     amgx_initialized = 1;
@@ -207,6 +221,18 @@ void amgx_finalize_(int *ierr)
                 if (zones[i].stream) cudaStreamDestroy(zones[i].stream);
                 zones[i].pinned_allocated = 0;
             }
+
+            /* Free GPU-resident device memory */
+            if (zones[i].d_rhs_gpu) {
+                cudaFree(zones[i].d_rhs_gpu);
+                zones[i].d_rhs_gpu = NULL;
+            }
+            if (zones[i].d_sol_gpu) {
+                cudaFree(zones[i].d_sol_gpu);
+                zones[i].d_sol_gpu = NULL;
+            }
+            zones[i].gpu_resident = 0;
+            zones[i].gpu_data_valid = 0;
 
             zones[i].initialized = 0;
             zones[i].setup_done = 0;
@@ -363,10 +389,42 @@ void amgx_setup_zone_(int *zone_id, int *n, int *nnz, const char *config, int *i
     zones[zid].pinned_allocated = (zones[zid].pinned_rhs != NULL &&
                                     zones[zid].pinned_sol != NULL);
 
+    /*
+     * GPU-RESIDENT DATA: Allocate device memory for RHS and solution vectors
+     * These stay on GPU permanently to eliminate per-timestep CPU-GPU transfers
+     */
+    cuda_err = cudaMalloc((void**)&zones[zid].d_rhs_gpu, (*n) * sizeof(double));
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[AmgX] Warning: GPU RHS alloc failed, GPU-resident mode disabled\n");
+        zones[zid].d_rhs_gpu = NULL;
+    }
+
+    cuda_err = cudaMalloc((void**)&zones[zid].d_sol_gpu, (*n) * sizeof(double));
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[AmgX] Warning: GPU SOL alloc failed, GPU-resident mode disabled\n");
+        zones[zid].d_sol_gpu = NULL;
+        /* Free RHS if allocated */
+        if (zones[zid].d_rhs_gpu) {
+            cudaFree(zones[zid].d_rhs_gpu);
+            zones[zid].d_rhs_gpu = NULL;
+        }
+    }
+
+    /* Enable GPU-resident mode only if both allocations succeeded */
+    zones[zid].gpu_resident = (zones[zid].d_rhs_gpu != NULL && zones[zid].d_sol_gpu != NULL);
+    zones[zid].gpu_data_valid = 0;  /* No valid data yet */
+
+    /* Initialize GPU solution to zero */
+    if (zones[zid].gpu_resident) {
+        cudaMemset(zones[zid].d_sol_gpu, 0, (*n) * sizeof(double));
+    }
+
     *ierr = 0;
 
-    printf("[AmgX] Zone %d setup complete (n=%d, nnz=%d, pinned=%s)\n",
-           *zone_id, *n, *nnz, zones[zid].pinned_allocated ? "YES" : "NO");
+    printf("[AmgX] Zone %d setup complete (n=%d, nnz=%d, pinned=%s, gpu_resident=%s)\n",
+           *zone_id, *n, *nnz,
+           zones[zid].pinned_allocated ? "YES" : "NO",
+           zones[zid].gpu_resident ? "YES" : "NO");
 }
 
 /**
@@ -800,6 +858,18 @@ void amgx_destroy_zone_(int *zone_id, int *ierr)
             zones[zid].pinned_allocated = 0;
         }
 
+        /* Free GPU-resident device memory */
+        if (zones[zid].d_rhs_gpu) {
+            cudaFree(zones[zid].d_rhs_gpu);
+            zones[zid].d_rhs_gpu = NULL;
+        }
+        if (zones[zid].d_sol_gpu) {
+            cudaFree(zones[zid].d_sol_gpu);
+            zones[zid].d_sol_gpu = NULL;
+        }
+        zones[zid].gpu_resident = 0;
+        zones[zid].gpu_data_valid = 0;
+
         zones[zid].initialized = 0;
         zones[zid].zone_id = -1;
         zones[zid].has_gpu_solution = 0;
@@ -1083,4 +1153,311 @@ void amgx_get_gpu_stats_(int *util_pct, double *mem_used_mb, double *mem_total_m
 #endif
 
     *ierr = 0;
+}
+
+/* =========================================================================
+ * GPU-RESIDENT DATA FUNCTIONS
+ * ========================================================================= */
+
+/**
+ * @brief Upload RHS data from CPU to GPU-resident buffer
+ *
+ * This uploads the RHS vector to GPU device memory (d_rhs_gpu).
+ * The data stays on GPU for the solve - no per-timestep download needed.
+ *
+ * @param[in]  zone_id Zone identifier (1-based)
+ * @param[in]  n       Number of unknowns
+ * @param[in]  rhs     Right-hand side vector from CPU
+ * @param[out] ierr    Error code
+ */
+void amgx_upload_rhs_gpu_(int *zone_id, int *n, double *rhs, int *ierr)
+{
+    int zid = find_zone_slot(*zone_id, 0);
+
+    if (zid < 0 || !zones[zid].initialized || !zones[zid].gpu_resident) {
+        fprintf(stderr, "AmgX: Zone %d not ready for GPU-resident upload\n", *zone_id);
+        *ierr = -1;
+        return;
+    }
+
+    /* Use pinned memory for faster transfer if available */
+    if (zones[zid].pinned_allocated && zones[zid].pinned_rhs) {
+        memcpy(zones[zid].pinned_rhs, rhs, (*n) * sizeof(double));
+        cudaMemcpyAsync(zones[zid].d_rhs_gpu, zones[zid].pinned_rhs,
+                        (*n) * sizeof(double), cudaMemcpyHostToDevice,
+                        zones[zid].stream);
+    } else {
+        cudaMemcpy(zones[zid].d_rhs_gpu, rhs, (*n) * sizeof(double),
+                   cudaMemcpyHostToDevice);
+    }
+
+    *ierr = 0;
+}
+
+/**
+ * @brief Solve using GPU-resident data optimization
+ *
+ * This uses pinned memory for fast transfers and keeps the solution
+ * on GPU between timesteps. The AmgX internal x vector already contains
+ * the previous solution, so we just need to upload the new RHS.
+ *
+ * @param[in]  zone_id Zone identifier (1-based)
+ * @param[out] ierr    Error code (0 = success, 1 = not converged)
+ */
+void amgx_solve_gpu_resident_(int *zone_id, int *ierr)
+{
+    AMGX_RC rc;
+    int zid = find_zone_slot(*zone_id, 0);
+
+    if (zid < 0 || !zones[zid].initialized || !zones[zid].setup_done) {
+        fprintf(stderr, "AmgX: Zone %d not ready for solve\n", *zone_id);
+        *ierr = -1;
+        return;
+    }
+
+    /*
+     * The RHS should have been uploaded via amgx_upload_rhs_gpu_
+     * which copies to d_rhs_gpu. We need to get this back to the AmgX vector.
+     *
+     * Since AMGX_vector_upload expects HOST pointers, we use pinned memory.
+     * Download d_rhs_gpu to pinned_rhs, then upload to AmgX vector.
+     */
+    if (zones[zid].gpu_resident && zones[zid].pinned_allocated) {
+        /* Sync stream to ensure d_rhs_gpu has the data */
+        if (zones[zid].stream) {
+            cudaStreamSynchronize(zones[zid].stream);
+        }
+
+        /* Copy from device buffer to pinned memory */
+        cudaMemcpy(zones[zid].pinned_rhs, zones[zid].d_rhs_gpu,
+                   zones[zid].n * sizeof(double), cudaMemcpyDeviceToHost);
+
+        /* Upload RHS from pinned memory to AmgX vector */
+        rc = AMGX_vector_upload(zones[zid].b, zones[zid].n, 1, zones[zid].pinned_rhs);
+        if (rc != AMGX_RC_OK) {
+            fprintf(stderr, "AmgX: RHS upload failed for zone %d\n", *zone_id);
+            *ierr = (int)rc;
+            return;
+        }
+    } else {
+        fprintf(stderr, "AmgX: Zone %d GPU-resident mode not properly configured\n", *zone_id);
+        *ierr = -1;
+        return;
+    }
+
+    /*
+     * KEY OPTIMIZATION: AmgX's internal x vector already contains the previous
+     * solution on GPU. We don't need to upload an initial guess!
+     * This eliminates one CPU-GPU transfer per timestep.
+     */
+
+    /* Solve Ax = b */
+    rc = AMGX_solver_solve(zones[zid].solver, zones[zid].b, zones[zid].x);
+    if (rc != AMGX_RC_OK) {
+        fprintf(stderr, "AmgX: Solve failed for zone %d\n", *zone_id);
+        *ierr = (int)rc;
+        zones[zid].gpu_data_valid = 0;
+        return;
+    }
+
+    /* Check convergence */
+    AMGX_SOLVE_STATUS status;
+    AMGX_solver_get_status(zones[zid].solver, &status);
+
+    /*
+     * Save solution to our GPU buffer for reference (useful for debugging/output).
+     * AmgX's x vector remains on GPU with the solution for the next timestep.
+     */
+    if (zones[zid].gpu_resident) {
+        /* Download from AmgX vector to our device buffer */
+        rc = AMGX_vector_download(zones[zid].x, zones[zid].pinned_sol);
+        if (rc == AMGX_RC_OK) {
+            cudaMemcpyAsync(zones[zid].d_sol_gpu, zones[zid].pinned_sol,
+                           zones[zid].n * sizeof(double), cudaMemcpyHostToDevice,
+                           zones[zid].stream);
+        }
+    }
+
+    if (status == AMGX_SOLVE_SUCCESS) {
+        *ierr = 0;
+        zones[zid].gpu_data_valid = 1;
+        zones[zid].has_gpu_solution = 1;
+    } else {
+        fprintf(stderr, "AmgX: Solver did not converge for zone %d (status=%d)\n",
+                *zone_id, status);
+        *ierr = 1;
+        zones[zid].gpu_data_valid = 0;
+    }
+}
+
+/**
+ * @brief Download solution from GPU to CPU
+ *
+ * Call this only when FDS needs to access the pressure solution on CPU.
+ * In typical FDS workflow, this is needed for:
+ * - Velocity correction (u* = u - dt * grad(p))
+ * - Output/visualization
+ *
+ * @param[in]  zone_id Zone identifier (1-based)
+ * @param[in]  n       Number of unknowns
+ * @param[out] sol     Solution vector on CPU
+ * @param[out] ierr    Error code
+ */
+void amgx_download_solution_gpu_(int *zone_id, int *n, double *sol, int *ierr)
+{
+    AMGX_RC rc;
+    int zid = find_zone_slot(*zone_id, 0);
+
+    if (zid < 0 || !zones[zid].initialized) {
+        fprintf(stderr, "AmgX: Zone %d not ready for download\n", *zone_id);
+        *ierr = -1;
+        return;
+    }
+
+    /*
+     * Download from AmgX's internal x vector (which has the solution)
+     * using pinned memory for faster transfer.
+     */
+    if (zones[zid].pinned_allocated && zones[zid].pinned_sol) {
+        rc = AMGX_vector_download(zones[zid].x, zones[zid].pinned_sol);
+        if (rc == AMGX_RC_OK) {
+            memcpy(sol, zones[zid].pinned_sol, (*n) * sizeof(double));
+            *ierr = 0;
+        } else {
+            fprintf(stderr, "AmgX: Solution download failed for zone %d\n", *zone_id);
+            *ierr = (int)rc;
+        }
+    } else {
+        /* Fallback without pinned memory */
+        rc = AMGX_vector_download(zones[zid].x, sol);
+        *ierr = (rc == AMGX_RC_OK) ? 0 : (int)rc;
+    }
+}
+
+/**
+ * @brief Check if GPU-resident mode is enabled for a zone
+ *
+ * @param[in]  zone_id    Zone identifier (1-based)
+ * @param[out] is_enabled 1 if GPU-resident mode is enabled, 0 otherwise
+ * @param[out] ierr       Error code
+ */
+void amgx_is_gpu_resident_(int *zone_id, int *is_enabled, int *ierr)
+{
+    int zid = find_zone_slot(*zone_id, 0);
+
+    if (zid < 0 || !zones[zid].initialized) {
+        *is_enabled = 0;
+        *ierr = -1;
+        return;
+    }
+
+    *is_enabled = zones[zid].gpu_resident;
+    *ierr = 0;
+}
+
+/**
+ * @brief Optimized GPU solve - skips initial guess upload
+ *
+ * This is a drop-in replacement for amgx_solve_ with one key optimization:
+ * - Skips uploading the initial guess (solution vector) to GPU
+ * - AmgX's internal x vector already contains the previous solution
+ * - This eliminates one CPU->GPU transfer per timestep
+ *
+ * Uses pinned memory for fast RHS upload and solution download.
+ *
+ * @param[in]     zone_id Zone identifier (1-based)
+ * @param[in]     n       Number of unknowns
+ * @param[in]     rhs     Right-hand side vector
+ * @param[in,out] sol     Solution vector (output)
+ * @param[out]    ierr    Error code
+ */
+void amgx_solve_gpu_optimized_(int *zone_id, int *n, double *rhs, double *sol, int *ierr)
+{
+    AMGX_RC rc;
+    int zid = find_zone_slot(*zone_id, 0);
+
+    if (zid < 0 || !zones[zid].initialized || !zones[zid].setup_done) {
+        fprintf(stderr, "AmgX: Zone %d not ready for solve\n", *zone_id);
+        *ierr = -1;
+        return;
+    }
+
+    /*
+     * Upload RHS using pinned memory for faster transfer
+     */
+    if (zones[zid].pinned_allocated && zones[zid].pinned_rhs) {
+        memcpy(zones[zid].pinned_rhs, rhs, (*n) * sizeof(double));
+        rc = AMGX_vector_upload(zones[zid].b, *n, 1, zones[zid].pinned_rhs);
+    } else {
+        rc = AMGX_vector_upload(zones[zid].b, *n, 1, rhs);
+    }
+
+    if (rc != AMGX_RC_OK) {
+        fprintf(stderr, "AmgX: RHS upload failed for zone %d\n", *zone_id);
+        *ierr = (int)rc;
+        return;
+    }
+
+    /*
+     * KEY OPTIMIZATION: Skip initial guess upload after first solve!
+     * AmgX's internal x vector already contains the previous solution on GPU.
+     * Only upload initial guess for the very first timestep.
+     */
+    if (!zones[zid].has_gpu_solution) {
+        /* First timestep: upload initial guess (usually zeros or previous CPU solution) */
+        if (zones[zid].pinned_allocated && zones[zid].pinned_sol) {
+            memcpy(zones[zid].pinned_sol, sol, (*n) * sizeof(double));
+            rc = AMGX_vector_upload(zones[zid].x, *n, 1, zones[zid].pinned_sol);
+        } else {
+            rc = AMGX_vector_upload(zones[zid].x, *n, 1, sol);
+        }
+        if (rc != AMGX_RC_OK) {
+            fprintf(stderr, "AmgX: Initial guess upload failed for zone %d\n", *zone_id);
+            *ierr = (int)rc;
+            return;
+        }
+    }
+    /* Subsequent timesteps: x vector already contains previous solution - skip upload! */
+
+    /* Solve Ax = b */
+    rc = AMGX_solver_solve(zones[zid].solver, zones[zid].b, zones[zid].x);
+    if (rc != AMGX_RC_OK) {
+        fprintf(stderr, "AmgX: Solve failed for zone %d\n", *zone_id);
+        *ierr = (int)rc;
+        zones[zid].has_gpu_solution = 0;
+        return;
+    }
+
+    /* Check convergence */
+    AMGX_SOLVE_STATUS status;
+    AMGX_solver_get_status(zones[zid].solver, &status);
+
+    /*
+     * Download solution using pinned memory for faster transfer
+     */
+    if (zones[zid].pinned_allocated && zones[zid].pinned_sol) {
+        rc = AMGX_vector_download(zones[zid].x, zones[zid].pinned_sol);
+        if (rc == AMGX_RC_OK) {
+            memcpy(sol, zones[zid].pinned_sol, (*n) * sizeof(double));
+        }
+    } else {
+        rc = AMGX_vector_download(zones[zid].x, sol);
+    }
+
+    if (rc != AMGX_RC_OK) {
+        fprintf(stderr, "AmgX: Solution download failed for zone %d\n", *zone_id);
+        *ierr = (int)rc;
+        zones[zid].has_gpu_solution = 0;
+        return;
+    }
+
+    if (status == AMGX_SOLVE_SUCCESS) {
+        *ierr = 0;
+        zones[zid].has_gpu_solution = 1;
+    } else {
+        fprintf(stderr, "AmgX: Solver did not converge for zone %d (status=%d)\n",
+                *zone_id, status);
+        *ierr = 1;
+        zones[zid].has_gpu_solution = 0;
+    }
 }

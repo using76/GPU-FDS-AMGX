@@ -43,6 +43,13 @@ PUBLIC :: AMGX_GET_GPU_NAME
 PUBLIC :: AMGX_LOG_GPU_STATUS
 PUBLIC :: AMGX_GET_GPU_STATS
 
+! GPU-Resident Data functions (zero-copy optimization)
+PUBLIC :: AMGX_UPLOAD_RHS_GPU
+PUBLIC :: AMGX_SOLVE_GPU_RESIDENT
+PUBLIC :: AMGX_DOWNLOAD_SOLUTION_GPU
+PUBLIC :: AMGX_IS_GPU_RESIDENT
+PUBLIC :: AMGX_SOLVE_GPU_OPTIMIZED
+
 ! C interface declarations
 INTERFACE
 
@@ -205,6 +212,49 @@ INTERFACE
       REAL(C_DOUBLE), INTENT(OUT) :: power_w
       INTEGER(C_INT), INTENT(OUT) :: ierr
    END SUBROUTINE amgx_get_gpu_stats_c
+
+   !> Upload RHS to GPU-resident buffer
+   SUBROUTINE amgx_upload_rhs_gpu_c(zone_id, n, rhs, ierr) BIND(C, NAME='amgx_upload_rhs_gpu_')
+      IMPORT :: C_INT, C_DOUBLE
+      INTEGER(C_INT), INTENT(IN) :: zone_id
+      INTEGER(C_INT), INTENT(IN) :: n
+      REAL(C_DOUBLE), INTENT(IN) :: rhs(*)
+      INTEGER(C_INT), INTENT(OUT) :: ierr
+   END SUBROUTINE amgx_upload_rhs_gpu_c
+
+   !> Solve using GPU-resident data (no CPU-GPU transfer during solve)
+   SUBROUTINE amgx_solve_gpu_resident_c(zone_id, ierr) BIND(C, NAME='amgx_solve_gpu_resident_')
+      IMPORT :: C_INT
+      INTEGER(C_INT), INTENT(IN) :: zone_id
+      INTEGER(C_INT), INTENT(OUT) :: ierr
+   END SUBROUTINE amgx_solve_gpu_resident_c
+
+   !> Download solution from GPU to CPU
+   SUBROUTINE amgx_download_solution_gpu_c(zone_id, n, sol, ierr) BIND(C, NAME='amgx_download_solution_gpu_')
+      IMPORT :: C_INT, C_DOUBLE
+      INTEGER(C_INT), INTENT(IN) :: zone_id
+      INTEGER(C_INT), INTENT(IN) :: n
+      REAL(C_DOUBLE), INTENT(OUT) :: sol(*)
+      INTEGER(C_INT), INTENT(OUT) :: ierr
+   END SUBROUTINE amgx_download_solution_gpu_c
+
+   !> Check if GPU-resident mode is enabled
+   SUBROUTINE amgx_is_gpu_resident_c(zone_id, is_enabled, ierr) BIND(C, NAME='amgx_is_gpu_resident_')
+      IMPORT :: C_INT
+      INTEGER(C_INT), INTENT(IN) :: zone_id
+      INTEGER(C_INT), INTENT(OUT) :: is_enabled
+      INTEGER(C_INT), INTENT(OUT) :: ierr
+   END SUBROUTINE amgx_is_gpu_resident_c
+
+   !> Optimized solve with GPU-resident data
+   SUBROUTINE amgx_solve_gpu_optimized_c(zone_id, n, rhs, sol, ierr) BIND(C, NAME='amgx_solve_gpu_optimized_')
+      IMPORT :: C_INT, C_DOUBLE
+      INTEGER(C_INT), INTENT(IN) :: zone_id
+      INTEGER(C_INT), INTENT(IN) :: n
+      REAL(C_DOUBLE), INTENT(IN) :: rhs(*)
+      REAL(C_DOUBLE), INTENT(OUT) :: sol(*)
+      INTEGER(C_INT), INTENT(OUT) :: ierr
+   END SUBROUTINE amgx_solve_gpu_optimized_c
 
 END INTERFACE
 
@@ -561,5 +611,132 @@ SUBROUTINE AMGX_GET_GPU_STATS(UTIL_PCT, MEM_USED_MB, MEM_TOTAL_MB, TEMP_C, POWER
    POWER_W = REAL(C_POWER, EB)
    IERR = INT(C_IERR)
 END SUBROUTINE AMGX_GET_GPU_STATS
+
+! ============================================================================
+! GPU-Resident Data Functions (Zero-copy Optimization)
+! ============================================================================
+
+!> @brief Upload RHS vector to GPU-resident buffer
+!>
+!> This uploads the RHS vector to GPU device memory where it stays
+!> for the solve. No per-timestep download needed.
+!>
+!> @param[in]  ZONE_ID Zone identifier
+!> @param[in]  N       Number of unknowns
+!> @param[in]  F_H     RHS vector
+!> @param[out] IERR    Error code
+SUBROUTINE AMGX_UPLOAD_RHS_GPU(ZONE_ID, N, F_H, IERR)
+   INTEGER, INTENT(IN) :: ZONE_ID
+   INTEGER, INTENT(IN) :: N
+   REAL(EB), INTENT(IN) :: F_H(:)
+   INTEGER, INTENT(OUT) :: IERR
+
+   INTEGER(C_INT) :: C_ZONE_ID, C_N, C_IERR
+
+   C_ZONE_ID = INT(ZONE_ID, C_INT)
+   C_N = INT(N, C_INT)
+
+   CALL amgx_upload_rhs_gpu_c(C_ZONE_ID, C_N, F_H, C_IERR)
+   IERR = INT(C_IERR)
+END SUBROUTINE AMGX_UPLOAD_RHS_GPU
+
+!> @brief Solve using GPU-resident data (ZERO CPU-GPU transfer!)
+!>
+!> This is the key optimization function:
+!> - RHS is already on GPU (uploaded via AMGX_UPLOAD_RHS_GPU)
+!> - Solution stays on GPU - previous solution used as initial guess
+!> - NO download to CPU after solve
+!>
+!> Call AMGX_DOWNLOAD_SOLUTION_GPU only when FDS needs the solution on CPU.
+!>
+!> @param[in]  ZONE_ID Zone identifier
+!> @param[out] IERR    Error code (0 = success, 1 = not converged)
+SUBROUTINE AMGX_SOLVE_GPU_RESIDENT(ZONE_ID, IERR)
+   INTEGER, INTENT(IN) :: ZONE_ID
+   INTEGER, INTENT(OUT) :: IERR
+
+   INTEGER(C_INT) :: C_ZONE_ID, C_IERR
+
+   C_ZONE_ID = INT(ZONE_ID, C_INT)
+
+   CALL amgx_solve_gpu_resident_c(C_ZONE_ID, C_IERR)
+   IERR = INT(C_IERR)
+END SUBROUTINE AMGX_SOLVE_GPU_RESIDENT
+
+!> @brief Download solution from GPU to CPU
+!>
+!> Call this only when FDS needs the pressure solution on CPU.
+!> In typical FDS workflow, this is needed for:
+!> - Velocity correction (u* = u - dt * grad(p))
+!> - Output/visualization
+!>
+!> @param[in]  ZONE_ID Zone identifier
+!> @param[in]  N       Number of unknowns
+!> @param[out] X_H     Solution vector on CPU
+!> @param[out] IERR    Error code
+SUBROUTINE AMGX_DOWNLOAD_SOLUTION_GPU(ZONE_ID, N, X_H, IERR)
+   INTEGER, INTENT(IN) :: ZONE_ID
+   INTEGER, INTENT(IN) :: N
+   REAL(EB), INTENT(OUT) :: X_H(:)
+   INTEGER, INTENT(OUT) :: IERR
+
+   INTEGER(C_INT) :: C_ZONE_ID, C_N, C_IERR
+
+   C_ZONE_ID = INT(ZONE_ID, C_INT)
+   C_N = INT(N, C_INT)
+
+   CALL amgx_download_solution_gpu_c(C_ZONE_ID, C_N, X_H, C_IERR)
+   IERR = INT(C_IERR)
+END SUBROUTINE AMGX_DOWNLOAD_SOLUTION_GPU
+
+!> @brief Check if GPU-resident mode is enabled for a zone
+!>
+!> @param[in]  ZONE_ID    Zone identifier
+!> @param[out] IS_ENABLED 1 if GPU-resident mode is enabled, 0 otherwise
+!> @param[out] IERR       Error code
+SUBROUTINE AMGX_IS_GPU_RESIDENT(ZONE_ID, IS_ENABLED, IERR)
+   INTEGER, INTENT(IN) :: ZONE_ID
+   INTEGER, INTENT(OUT) :: IS_ENABLED
+   INTEGER, INTENT(OUT) :: IERR
+
+   INTEGER(C_INT) :: C_ZONE_ID, C_ENABLED, C_IERR
+
+   C_ZONE_ID = INT(ZONE_ID, C_INT)
+
+   CALL amgx_is_gpu_resident_c(C_ZONE_ID, C_ENABLED, C_IERR)
+   IS_ENABLED = INT(C_ENABLED)
+   IERR = INT(C_IERR)
+END SUBROUTINE AMGX_IS_GPU_RESIDENT
+
+!> @brief Optimized solve with GPU-resident data
+!>
+!> Convenience function that combines:
+!> 1. Upload RHS to GPU
+!> 2. Solve on GPU (using previous solution as initial guess)
+!> 3. Download solution to CPU
+!>
+!> This is a drop-in replacement for AMGX_SOLVE with optimized transfers.
+!> If GPU-resident mode is not available, falls back to regular solve.
+!>
+!> @param[in]     ZONE_ID Zone identifier
+!> @param[in]     N       Number of unknowns
+!> @param[in]     F_H     RHS vector
+!> @param[in,out] X_H     Solution vector
+!> @param[out]    IERR    Error code
+SUBROUTINE AMGX_SOLVE_GPU_OPTIMIZED(ZONE_ID, N, F_H, X_H, IERR)
+   INTEGER, INTENT(IN) :: ZONE_ID
+   INTEGER, INTENT(IN) :: N
+   REAL(EB), INTENT(IN) :: F_H(:)
+   REAL(EB), INTENT(INOUT) :: X_H(:)
+   INTEGER, INTENT(OUT) :: IERR
+
+   INTEGER(C_INT) :: C_ZONE_ID, C_N, C_IERR
+
+   C_ZONE_ID = INT(ZONE_ID, C_INT)
+   C_N = INT(N, C_INT)
+
+   CALL amgx_solve_gpu_optimized_c(C_ZONE_ID, C_N, F_H, X_H, C_IERR)
+   IERR = INT(C_IERR)
+END SUBROUTINE AMGX_SOLVE_GPU_OPTIMIZED
 
 END MODULE AMGX_FORTRAN

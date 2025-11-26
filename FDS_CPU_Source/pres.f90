@@ -1741,8 +1741,8 @@ CASE(AMGX_FLAG) LIBRARY_SELECT
    ! Handle indefinite matrix case
    IF (ZM%MTYPE==SYMM_INDEFINITE) ZM%F_H(ZM%NUNKH) = 0._EB
 
-   ! Solve using AmgX GPU solver
-   CALL AMGX_SOLVE(ZM%AMGX_ZONE_ID, ZM%NUNKH, ZM%F_H, ZM%X_H, ERROR)
+   ! Solve using AmgX GPU solver (GPU-optimized with resident data)
+   CALL AMGX_SOLVE_GPU_OPTIMIZED(ZM%AMGX_ZONE_ID, ZM%NUNKH, ZM%F_H, ZM%X_H, ERROR)
 
    ! Validate solution (check for NaN, Inf, bounds)
    CALL AMGX_CHECK_SOLUTION(ZM%NUNKH, ZM%X_H, ZM%AMGX_ZONE_ID, SOL_VALID, SOL_ERROR_MSG)

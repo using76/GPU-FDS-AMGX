@@ -18,7 +18,7 @@
 #   export CUDA_HOME=/usr/local/cuda
 #   make -f makefile_amgx impi_intel_linux_amgx_openmp
 
-VPATH = ../Source
+VPATH = ../Source:../FDS_CPU_Source
 
 # 3rd party library versions
 HYPRE_VERSION=v2.33.0
